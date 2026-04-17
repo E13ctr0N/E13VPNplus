@@ -1,20 +1,36 @@
-# E13VPN
+# E13VPN+
 
-Легковесный VPN-клиент для Windows с поддержкой VLESS+Reality.
+VPN-клиент для Windows с поддержкой VLESS+Reality, включая транспорты `xhttp` / `splithttp`.
 
-Построен на Tauri v2, React 19, sing-box 1.13, Vite 7.
+Построен на Tauri v2, React 19, sing-box 1.13 + Xray-core + tun2socks, Vite 7.
 
 <p align="center">
   <img src="screenshots/vpn-connected.png" width="420" alt="VPN подключен">
   <img src="screenshots/settings.png" width="420" alt="Настройки">
 </p>
 
+## Отличия от [E13VPN](https://github.com/E13ctr0N/E13VPN)
+
+E13VPN+ — расширенная версия базового клиента. Помимо всего, что умеет E13VPN,
+добавлена поддержка `xhttp` / `splithttp` через Xray-core и `tun2socks` для
+TUN-режима с этими транспортами.
+
+- **Когда выбирать E13VPN+**: сервер использует `xhttp` / `splithttp` (лучше
+  обходит DPI, чем чистый TCP+Reality в 2025-2026).
+- **Когда достаточно E13VPN**: сервер работает на `tcp` / `ws` / `grpc` /
+  `quic` / `httpupgrade` — меньше размер инсталлятора (~14 МБ против ~28 МБ).
+
+Автоматический выбор движка по транспорту из VLESS-ссылки:
+- `xhttp` / `splithttp` → Xray (+ tun2socks для TUN-режима)
+- остальные → sing-box
+
 ## Возможности
 
+- **Поддерживаемые транспорты**: `tcp`, `ws`, `http`, `grpc`, `quic`, `httpupgrade`, `xhttp`, `splithttp`
 - **Proxy-режим** — HTTP/SOCKS прокси на рандомном порту
 - **TUN-режим** — весь системный трафик через зашифрованный туннель
 - Индикатор скорости в реальном времени (загрузка/отдача)
-- Маршруты обхода по доменам, IP-адресам и приложениям
+- Маршруты обхода по доменам, IP-адресам и приложениям (только sing-box)
 - Автопереподключение с экспоненциальным backoff и защитой от бесконечного цикла
 - Управление VLESS-конфигами с шифрованием DPAPI
 - Тёмная / Светлая тема
@@ -23,8 +39,8 @@
 - Автозапуск с Windows
 - Иконка в трее с динамическим статусом
 - Защита от запуска второго экземпляра
-- Просмотр логов sing-box с автопрокруткой
-- Clash API защищён сессионным секретом
+- Просмотр логов ядра с автопрокруткой
+- Clash API защищён сессионным секретом (только sing-box)
 
 ## Установка
 
@@ -42,6 +58,9 @@ npm install
 npm run tauri build
 ```
 
+Бинарники `sing-box`, `xray` и `tun2socks` бандлятся в инсталлятор
+(см. `src-tauri/binaries/`). Целостность проверяется по SHA256 при запуске.
+
 ## Стек
 
 | Компонент | Версия |
@@ -49,9 +68,18 @@ npm run tauri build
 | Tauri | v2 |
 | React | 19.1 |
 | sing-box | 1.13.3 |
+| Xray-core | latest |
+| tun2socks | xjasonlyu |
 | Vite | 7 |
 | TypeScript | 5.8 |
 | Tailwind CSS | 4.2 |
+
+## Известные ограничения
+
+- `bypass_apps` (обход по приложениям) работает только с sing-box — Xray не
+  поддерживает per-process routing.
+- Clash API недоступен при подключении через Xray (xhttp/splithttp). IP-reveal
+  и детальная статистика работают только на sing-box транспортах.
 
 ## Лицензия
 
