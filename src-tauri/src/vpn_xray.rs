@@ -14,7 +14,9 @@
 //!   но конфиг здесь всегда генерирует HTTP+SOCKS — tun2socks соединяется с SOCKS
 //!   как внешний SOCKS5-клиент.
 
-use crate::vpn::{is_network_entry, is_valid_domain, normalize_entry, VlessParams, VpnMode};
+use crate::vpn::{
+    is_network_entry, is_valid_domain, normalize_entry, RoutePolicy, VlessParams, VpnMode,
+};
 
 /// Строит Xray JSON конфиг для vless+xhttp/splithttp.
 ///
@@ -26,6 +28,7 @@ pub fn generate_xray_config(
     bypass: &[String],
     _bypass_apps: &[String], // Xray не умеет per-process; игнорируется здесь, вызывающий код логирует warn
     _mode: &VpnMode,         // конфиг одинаковый для Proxy/Tun — TUN оркеструется внешним tun2socks
+    route_policy: &RoutePolicy,
     proxy_port: u16,
 ) -> serde_json::Value {
     // ===== streamSettings.security =====
@@ -120,6 +123,10 @@ pub fn generate_xray_config(
 
     // ===== routing rules: bypass → direct =====
     let mut routing_rules: Vec<serde_json::Value> = Vec::new();
+    let selected_outbound = match route_policy {
+        RoutePolicy::Bypass => "direct",
+        RoutePolicy::OnlyVpn => "proxy",
+    };
 
     // VPN-сервер всегда мимо (избегаем петли в TUN-режиме через tun2socks).
     if !p.host.is_empty() {
@@ -152,14 +159,14 @@ pub fn generate_xray_config(
         routing_rules.push(serde_json::json!({
             "type": "field",
             "domain": valid_domains,
-            "outboundTag": "direct"
+            "outboundTag": selected_outbound
         }));
     }
     if !ip_nets.is_empty() {
         routing_rules.push(serde_json::json!({
             "type": "field",
             "ip": ip_nets,
-            "outboundTag": "direct"
+            "outboundTag": selected_outbound
         }));
     }
 
@@ -180,6 +187,14 @@ pub fn generate_xray_config(
         ],
         "outboundTag": "direct"
     }));
+
+    if *route_policy == RoutePolicy::OnlyVpn {
+        routing_rules.push(serde_json::json!({
+            "type": "field",
+            "network": "tcp,udp",
+            "outboundTag": "direct"
+        }));
+    }
 
     // ===== собираем итоговый конфиг =====
     serde_json::json!({
@@ -210,15 +225,29 @@ mod tests {
         let p = parse_vless_uri(uri).expect("parse xhttp URI");
         assert_eq!(p.transport_type, "xhttp");
 
-        let cfg = generate_xray_config(&p, &[], &[], &VpnMode::Proxy, 10800);
+        let cfg = generate_xray_config(&p, &[], &[], &VpnMode::Proxy, &RoutePolicy::Bypass, 10800);
         let ob = &cfg["outbounds"][0];
         assert_eq!(ob["protocol"], "vless");
         assert_eq!(ob["streamSettings"]["network"], "xhttp");
         assert_eq!(ob["streamSettings"]["security"], "reality");
-        assert_eq!(ob["streamSettings"]["realitySettings"]["publicKey"], "testpbk");
+        assert_eq!(
+            ob["streamSettings"]["realitySettings"]["publicKey"],
+            "testpbk"
+        );
         assert_eq!(ob["streamSettings"]["xhttpSettings"]["path"], "/ray");
         assert_eq!(cfg["inbounds"][0]["port"], 10800);
         assert_eq!(cfg["inbounds"][1]["port"], 10801);
+    }
+
+    #[test]
+    fn xray_socks_inbound_can_use_last_dynamic_port() {
+        let uri = "vless://11111111-1111-1111-1111-111111111111@example.com:443\
+                   ?type=xhttp&security=reality&pbk=testpbk&sid=abcd&sni=www.google.com#test";
+        let p = parse_vless_uri(uri).expect("parse xhttp URI");
+
+        let cfg = generate_xray_config(&p, &[], &[], &VpnMode::Proxy, &RoutePolicy::Bypass, 65534);
+        assert_eq!(cfg["inbounds"][0]["port"], 65534);
+        assert_eq!(cfg["inbounds"][1]["port"], 65535);
     }
 
     #[test]
@@ -230,7 +259,7 @@ mod tests {
         let p = parse_vless_uri(uri).expect("parse splithttp URI");
         assert_eq!(p.transport_type, "splithttp");
 
-        let cfg = generate_xray_config(&p, &[], &[], &VpnMode::Proxy, 10800);
+        let cfg = generate_xray_config(&p, &[], &[], &VpnMode::Proxy, &RoutePolicy::Bypass, 10800);
         assert_eq!(cfg["outbounds"][0]["streamSettings"]["network"], "xhttp");
     }
 
@@ -240,9 +269,48 @@ mod tests {
                    ?type=xhttp&security=reality&pbk=x#t";
         let p = parse_vless_uri(uri).unwrap();
         let bypass = vec!["ru".to_string(), "10.0.0.0/8".to_string()];
-        let cfg = generate_xray_config(&p, &bypass, &[], &VpnMode::Proxy, 10800);
+        let cfg = generate_xray_config(
+            &p,
+            &bypass,
+            &[],
+            &VpnMode::Proxy,
+            &RoutePolicy::Bypass,
+            10800,
+        );
         let rules = cfg["routing"]["rules"].as_array().unwrap();
         // server IP + domain bypass + ip bypass + geoip:private
         assert!(rules.len() >= 4);
+    }
+
+    #[test]
+    fn only_vpn_rules_proxy_selected_and_catch_all_direct() {
+        let uri = "vless://11111111-1111-1111-1111-111111111111@1.2.3.4:443\
+                   ?type=xhttp&security=reality&pbk=x#t";
+        let p = parse_vless_uri(uri).unwrap();
+        let selected = vec!["example.com".to_string(), "203.0.113.0/24".to_string()];
+        let cfg = generate_xray_config(
+            &p,
+            &selected,
+            &[],
+            &VpnMode::Proxy,
+            &RoutePolicy::OnlyVpn,
+            10800,
+        );
+        let rules = cfg["routing"]["rules"].as_array().unwrap();
+        assert!(rules.iter().any(|rule| {
+            rule["domain"]
+                .as_array()
+                .is_some_and(|domains| domains.iter().any(|d| d == "domain:example.com"))
+                && rule["outboundTag"] == "proxy"
+        }));
+        assert!(rules.iter().any(|rule| {
+            rule["ip"]
+                .as_array()
+                .is_some_and(|nets| nets.iter().any(|net| net == "203.0.113.0/24"))
+                && rule["outboundTag"] == "proxy"
+        }));
+        assert!(rules
+            .iter()
+            .any(|rule| { rule["network"] == "tcp,udp" && rule["outboundTag"] == "direct" }));
     }
 }

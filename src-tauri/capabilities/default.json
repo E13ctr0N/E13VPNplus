@@ -10,11 +10,6 @@
     "core:window:allow-start-dragging",
     "store:default",
     "clipboard-manager:allow-read-text",
-    {
-      "identifier": "shell:allow-execute",
-      "allow": [{ "name": "sing-box", "sidecar": true, "args": true }]
-    },
-    "shell:allow-kill",
     "autostart:allow-enable",
     "autostart:allow-disable",
     "autostart:allow-is-enabled",

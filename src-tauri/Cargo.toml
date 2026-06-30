@@ -1,6 +1,6 @@
 [package]
 name = "e13vpn"
-version = "0.9.2"
+version = "0.9.6"
 description = "E13 App"
 authors = ["E13"]
 edition = "2021"
@@ -30,6 +30,7 @@ sha2 = "0.10"
 base64 = "0.22"
 tokio = { version = "1", features = ["sync", "time"] }
 tauri-plugin-single-instance = "2.4.1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 
 [features]
 # "full" сборка — включает поддержку vless xhttp/splithttp через Xray + tun2socks.
@@ -38,8 +39,8 @@ default = ["xhttp"]
 xhttp = []
 
 [target.'cfg(windows)'.dependencies]
-winreg = "0.52"
-windows-sys = { version = "0.60", features = [
+winreg = "0.56"
+windows-sys = { version = "0.61", features = [
     "Win32_Networking_WinInet",
     "Win32_Security",
     "Win32_System_Threading",
@@ -50,4 +51,3 @@ windows-sys = { version = "0.60", features = [
     "Win32_UI_Shell",
     "Win32_Security_Cryptography",
 ] }
-

@@ -9,6 +9,14 @@ interface SettingsScreenProps {
   setAutostart: (v: boolean) => void;
   autoReconnect: boolean;
   setAutoReconnect: (v: boolean) => void;
+  autoConnectOnAutostart: boolean;
+  setAutoConnectOnAutostart: (v: boolean) => void;
+  proxyUseSystemProxy: boolean;
+  setProxyUseSystemProxy: (v: boolean) => void;
+  proxyRandomPort: boolean;
+  setProxyRandomPort: (v: boolean) => void;
+  proxyFixedPort: number;
+  setProxyFixedPort: (v: number) => void;
   uiScale: 100 | 125 | 150;
   setUiScale: (v: 100 | 125 | 150) => void;
   theme: Theme;
@@ -20,6 +28,14 @@ export function SettingsScreen({
   setAutostart,
   autoReconnect,
   setAutoReconnect,
+  autoConnectOnAutostart,
+  setAutoConnectOnAutostart,
+  proxyUseSystemProxy,
+  setProxyUseSystemProxy,
+  proxyRandomPort,
+  setProxyRandomPort,
+  proxyFixedPort,
+  setProxyFixedPort,
   uiScale,
   setUiScale,
   theme,
@@ -32,7 +48,7 @@ export function SettingsScreen({
     <div
       style={{
         flex: 1,
-        overflow: "hidden",
+        overflowY: "auto",
         padding: "14px",
         display: "flex",
         flexDirection: "column",
@@ -70,13 +86,67 @@ export function SettingsScreen({
               if (v) await enable();
               else await disable();
               setAutostart(v);
+              if (!v) setAutoConnectOnAutostart(false);
             } catch {}
+          }}
+        />
+      </SettingRow>
+
+      <SettingRow label={t("settings.auto_connect_start")} description={t("settings.auto_connect_start_desc")}>
+        <Toggle
+          value={autoConnectOnAutostart}
+          disabled={!autostart}
+          onChange={async (v) => {
+            if (v && autostart) {
+              try {
+                await enable();
+              } catch {}
+            }
+            setAutoConnectOnAutostart(v);
           }}
         />
       </SettingRow>
 
       <SettingRow label={t("settings.auto_reconnect")} description={t("settings.auto_reconnect_desc")}>
         <Toggle value={autoReconnect} onChange={setAutoReconnect} />
+      </SettingRow>
+
+      <SettingRow label={t("settings.proxy_system")} description={t("settings.proxy_system_desc")}>
+        <Toggle value={proxyUseSystemProxy} onChange={setProxyUseSystemProxy} />
+      </SettingRow>
+
+      <SettingRow label={t("settings.proxy_random_port")} description={t("settings.proxy_random_port_desc")}>
+        <Toggle value={proxyRandomPort} onChange={setProxyRandomPort} />
+      </SettingRow>
+
+      <SettingRow label={t("settings.proxy_fixed_port")} description={t("settings.proxy_fixed_port_desc")}>
+        <input
+          type="number"
+          min={1024}
+          max={65534}
+          step={1}
+          value={proxyFixedPort}
+          disabled={proxyRandomPort}
+          onChange={(e) => {
+            const next = Math.trunc(Number(e.currentTarget.value));
+            if (Number.isFinite(next)) {
+              setProxyFixedPort(Math.max(1024, Math.min(65534, next)));
+            }
+          }}
+          style={{
+            width: "72px",
+            height: "24px",
+            border: "1px solid var(--color-border)",
+            borderRadius: "var(--radius-sm)",
+            background: "var(--color-surface-hover)",
+            color: proxyRandomPort ? "var(--color-text-ghost)" : "var(--color-text-secondary)",
+            fontFamily: "var(--font-system)",
+            fontSize: "10px",
+            padding: "0 6px",
+            outline: "none",
+            opacity: proxyRandomPort ? 0.45 : 1,
+          }}
+        />
       </SettingRow>
 
       <SettingRow label={t("settings.language")}>

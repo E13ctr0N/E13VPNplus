@@ -4,11 +4,13 @@ import { invoke } from "@tauri-apps/api/core";
 import { useT } from "../i18n";
 
 const STORE_FILE = "vpn.json";
+type RoutePolicy = "bypass" | "only_vpn";
 
 export function RoutesScreen() {
   const t = useT();
   const [bypass, setBypass] = useState<string[]>([]);
   const [bypassApps, setBypassApps] = useState<string[]>([]);
+  const [routePolicy, setRoutePolicy] = useState<RoutePolicy>("bypass");
   const [inputSites, setInputSites] = useState("");
   const [inputApps, setInputApps] = useState("");
   const [siteError, setSiteError] = useState("");
@@ -22,6 +24,7 @@ export function RoutesScreen() {
       storeRef.current = store;
       const rawBypass = (await store.get<string[]>("routes_bypass")) ?? [];
       const rawApps = (await store.get<string[]>("routes_bypass_apps")) ?? [];
+      const savedPolicy = (await store.get<RoutePolicy>("routes_policy")) ?? "bypass";
       // Мигрируем старые записи: нормализация + дедупликация (.ru → ru)
       const normalized: string[] = [];
       for (const entry of rawBypass) {
@@ -32,6 +35,7 @@ export function RoutesScreen() {
       }
       setBypass(normalized);
       setBypassApps(rawApps);
+      setRoutePolicy(savedPolicy);
       setStoreReady(true);
     });
   }, []);
@@ -42,9 +46,10 @@ export function RoutesScreen() {
     (async () => {
       await store.set("routes_bypass", bypass);
       await store.set("routes_bypass_apps", bypassApps);
+      await store.set("routes_policy", routePolicy);
       await store.save();
     })();
-  }, [bypass, bypassApps, storeReady]);
+  }, [bypass, bypassApps, routePolicy, storeReady]);
 
   async function addSite() {
     const raw = inputSites.trim();
@@ -74,10 +79,35 @@ export function RoutesScreen() {
 
   return (
     <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+      <div
+        style={{
+          height: "34px",
+          borderBottom: "1px solid var(--color-border)",
+          background: "var(--color-surface)",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          padding: "0 10px",
+          flexShrink: 0,
+        }}
+      >
+        <span
+          style={{
+            fontSize: "9px",
+            letterSpacing: "0.12em",
+            color: "var(--color-text-muted)",
+            textTransform: "uppercase",
+          }}
+        >
+          {t("routes.policy")}
+        </span>
+        <PolicySelector value={routePolicy} onChange={setRoutePolicy} />
+      </div>
+
       {/* Two-column list */}
       <div style={{ flex: 1, display: "flex", overflow: "hidden" }}>
         <RouteColumn
-          title={t("routes.sites")}
+          title={t(routePolicy === "only_vpn" ? "routes.only_sites" : "routes.sites")}
           accent="var(--color-text-muted)"
           entries={bypass}
           onRemove={(i) => setBypass((prev) => prev.filter((_, idx) => idx !== i))}
@@ -85,7 +115,7 @@ export function RoutesScreen() {
         />
         <div style={{ width: "1px", background: "var(--color-border)", flexShrink: 0 }} />
         <RouteColumn
-          title={t("routes.apps")}
+          title={t(routePolicy === "only_vpn" ? "routes.only_apps" : "routes.apps")}
           accent="var(--color-text-muted)"
           entries={bypassApps}
           onRemove={(i) => setBypassApps((prev) => prev.filter((_, idx) => idx !== i))}
@@ -125,6 +155,45 @@ export function RoutesScreen() {
           color="var(--color-text-muted)"
         />
       </div>
+    </div>
+  );
+}
+
+function PolicySelector({
+  value,
+  onChange,
+}: {
+  value: RoutePolicy;
+  onChange: (v: RoutePolicy) => void;
+}) {
+  const t = useT();
+  const options: { value: RoutePolicy; label: string }[] = [
+    { value: "bypass", label: t("routes.policy_bypass") },
+    { value: "only_vpn", label: t("routes.policy_only") },
+  ];
+
+  return (
+    <div style={{ display: "flex", gap: "2px" }}>
+      {options.map((opt) => (
+        <button
+          key={opt.value}
+          onClick={() => onChange(opt.value)}
+          style={{
+            padding: "3px 8px",
+            fontSize: "9px",
+            fontWeight: 500,
+            fontFamily: "var(--font-system)",
+            borderRadius: "var(--radius-sm)",
+            border: "none",
+            background: value === opt.value ? "var(--color-surface-hover)" : "transparent",
+            color: value === opt.value ? "var(--color-text-secondary)" : "var(--color-text-dim)",
+            cursor: "pointer",
+            transition: "background 0.15s, color 0.15s",
+          }}
+        >
+          {opt.label}
+        </button>
+      ))}
     </div>
   );
 }

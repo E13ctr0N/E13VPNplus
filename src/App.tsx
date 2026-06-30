@@ -23,6 +23,10 @@ function App() {
   const [lang, setLang] = useState<Lang>("ru");
   const [autostart, setAutostart] = useState(false);
   const [autoReconnect, setAutoReconnect] = useState(false);
+  const [autoConnectOnAutostart, setAutoConnectOnAutostart] = useState(false);
+  const [proxyUseSystemProxy, setProxyUseSystemProxy] = useState(true);
+  const [proxyRandomPort, setProxyRandomPort] = useState(true);
+  const [proxyFixedPort, setProxyFixedPort] = useState(2080);
   const [uiScale, setUiScale] = useState<100 | 125 | 150>(100);
   const [theme, setTheme] = useState<"dark" | "light">("dark");
   const [ready, setReady] = useState(false);
@@ -35,6 +39,10 @@ function App() {
       setLang((await store.get<Lang>("language")) ?? "ru");
       setAutostart((await store.get<boolean>("autostart")) ?? false);
       setAutoReconnect((await store.get<boolean>("auto_reconnect")) ?? false);
+      setAutoConnectOnAutostart((await store.get<boolean>("auto_connect_on_autostart")) ?? false);
+      setProxyUseSystemProxy((await store.get<boolean>("proxy_use_system_proxy")) ?? true);
+      setProxyRandomPort((await store.get<boolean>("proxy_random_port")) ?? true);
+      setProxyFixedPort((await store.get<number>("proxy_fixed_port")) ?? 2080);
 
       let scale = await store.get<100 | 125 | 150>("ui_scale");
       if (!scale) {
@@ -58,11 +66,26 @@ function App() {
       await store.set("language", lang);
       await store.set("autostart", autostart);
       await store.set("auto_reconnect", autoReconnect);
+      await store.set("auto_connect_on_autostart", autoConnectOnAutostart);
+      await store.set("proxy_use_system_proxy", proxyUseSystemProxy);
+      await store.set("proxy_random_port", proxyRandomPort);
+      await store.set("proxy_fixed_port", proxyFixedPort);
       await store.set("ui_scale", uiScale);
       await store.set("theme", theme);
       await store.save();
     })();
-  }, [lang, autostart, autoReconnect, uiScale, theme, ready]);
+  }, [
+    lang,
+    autostart,
+    autoReconnect,
+    autoConnectOnAutostart,
+    proxyUseSystemProxy,
+    proxyRandomPort,
+    proxyFixedPort,
+    uiScale,
+    theme,
+    ready,
+  ]);
 
   // Apply theme
   useEffect(() => {
@@ -108,6 +131,10 @@ function App() {
               setConnected={setConnected}
               setLogLines={setLogLines}
               autoReconnect={autoReconnect}
+              autoConnectOnAutostart={autoConnectOnAutostart}
+              proxyUseSystemProxy={proxyUseSystemProxy}
+              proxyRandomPort={proxyRandomPort}
+              proxyFixedPort={proxyFixedPort}
             />
           </div>
           <div style={{ flex: 1, display: tab === "routes" ? "flex" : "none", flexDirection: "column", overflow: "hidden" }}>
@@ -122,6 +149,14 @@ function App() {
               setAutostart={setAutostart}
               autoReconnect={autoReconnect}
               setAutoReconnect={setAutoReconnect}
+              autoConnectOnAutostart={autoConnectOnAutostart}
+              setAutoConnectOnAutostart={setAutoConnectOnAutostart}
+              proxyUseSystemProxy={proxyUseSystemProxy}
+              setProxyUseSystemProxy={setProxyUseSystemProxy}
+              proxyRandomPort={proxyRandomPort}
+              setProxyRandomPort={setProxyRandomPort}
+              proxyFixedPort={proxyFixedPort}
+              setProxyFixedPort={setProxyFixedPort}
               uiScale={uiScale}
               setUiScale={setUiScale}
               theme={theme}

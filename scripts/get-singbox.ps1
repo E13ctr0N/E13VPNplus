@@ -32,17 +32,37 @@ if (-not $exePath) {
     Write-Error "sing-box.exe not found in archive"
     exit 1
 }
+$cronetPath = Get-ChildItem -Path $extractDir -Filter "libcronet.dll" -Recurse |
+              Select-Object -First 1 -ExpandProperty FullName
+if (-not $cronetPath) {
+    Write-Error "libcronet.dll not found in archive; NaiveProxy outbound requires it"
+    exit 1
+}
 
 $triple  = "x86_64-pc-windows-msvc"
 $destName = "sing-box-$triple.exe"
 $destPath = Join-Path $outDir $destName
+$cronetDest = Join-Path $outDir "libcronet.dll"
 
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 Copy-Item -Path $exePath -Destination $destPath -Force
+Copy-Item -Path $cronetPath -Destination $cronetDest -Force
+
+$hash = Get-FileHash -Path $destPath -Algorithm SHA256 | Select-Object -ExpandProperty Hash
+$hashLower = $hash.ToLower()
+$cronetHash = Get-FileHash -Path $cronetDest -Algorithm SHA256 | Select-Object -ExpandProperty Hash
+$cronetHashLower = $cronetHash.ToLower()
 
 Remove-Item $zipPath -Force
 Remove-Item $extractDir -Recurse -Force
 
 Write-Host ""
 Write-Host "Done: $destPath" -ForegroundColor Green
+Write-Host "Done: $cronetDest" -ForegroundColor Green
 Write-Host "sing-box version: $version"
+Write-Host "SHA256: $hashLower" -ForegroundColor Yellow
+Write-Host "libcronet SHA256: $cronetHashLower" -ForegroundColor Yellow
+Write-Host ""
+Write-Host "=> Update src-tauri/src/lib.rs:" -ForegroundColor Cyan
+Write-Host "   const EXPECTED_SINGBOX_SHA256: &str = `"$hashLower`";"
+Write-Host "   const EXPECTED_LIBCRONET_SHA256: &str = `"$cronetHashLower`";"

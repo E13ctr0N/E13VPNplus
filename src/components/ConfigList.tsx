@@ -9,13 +9,20 @@ export interface VlessConfig {
 
 export function parseConfigHost(uri: string): string {
   try {
-    const s = uri.replace("vless://", "");
-    const afterAt = s.split("@")[1] ?? "";
-    const hostPort = afterAt.split("?")[0] ?? "";
-    return hostPort.replace(/:\d+$/, "");
+    if (uri.startsWith("vless://")) {
+      const s = uri.replace("vless://", "");
+      const afterAt = s.split("@")[1] ?? "";
+      const hostPort = afterAt.split("?")[0] ?? "";
+      return hostPort.replace(/:\d+$/, "");
+    }
+    if (uri.startsWith("naive+https://") || uri.startsWith("naive+quic://")) {
+      const parsed = new URL(uri.replace(/^naive\+/, ""));
+      return parsed.hostname;
+    }
   } catch {
-    return "";
+    // fall through
   }
+  return "";
 }
 
 interface ConfigListProps {
@@ -37,17 +44,16 @@ export function ConfigList({ configs, activeId, connected, onSelect, onRemove, o
           {t("vpn.servers")}
         </span>
         <span
-          onClick={connected ? undefined : onPaste}
+          onClick={onPaste}
           style={{
             fontSize: "9px",
-            color: configs.length === 0 && !connected ? "var(--color-success-text)" : "var(--color-text-muted)",
-            cursor: connected ? "default" : "pointer",
+            color: configs.length === 0 ? "var(--color-success-text)" : "var(--color-text-muted)",
+            cursor: "pointer",
             padding: "2px 8px",
             borderRadius: "3px",
-            opacity: connected ? 0.3 : 1,
             transition: "color 0.3s, opacity 0.15s",
           }}
-          onMouseEnter={(e) => { if (!connected) e.currentTarget.style.background = "var(--color-surface-hover)"; }}
+          onMouseEnter={(e) => { e.currentTarget.style.background = "var(--color-surface-hover)"; }}
           onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}
         >
           {t("vpn.paste")}
