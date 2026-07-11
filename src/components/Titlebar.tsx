@@ -28,7 +28,7 @@ export function Titlebar({ connected, showVersion }: { connected?: boolean; show
           transition: "color 0.3s",
         }}
       >
-        E13VPN
+        E13VPN+
         {showVersion && (
           <span style={{ fontSize: "10px", fontWeight: 400, color: "var(--color-text-ghost)", marginLeft: "6px" }}>
             v{APP_VERSION}

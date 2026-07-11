@@ -9,7 +9,55 @@ pub enum VpnMode {
 
 impl VpnMode {
     pub fn from_str(s: &str) -> Self {
-        if s == "tun" { VpnMode::Tun } else { VpnMode::Proxy }
+        if s == "tun" {
+            VpnMode::Tun
+        } else {
+            VpnMode::Proxy
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RoutePolicy {
+    Bypass,
+    OnlyVpn,
+}
+
+impl RoutePolicy {
+    pub fn from_str(s: &str) -> Self {
+        if s == "only_vpn" {
+            RoutePolicy::OnlyVpn
+        } else {
+            RoutePolicy::Bypass
+        }
+    }
+
+    fn selected_outbound(&self) -> &'static str {
+        match self {
+            RoutePolicy::Bypass => "direct",
+            RoutePolicy::OnlyVpn => "proxy",
+        }
+    }
+
+    fn final_outbound(&self) -> &'static str {
+        match self {
+            RoutePolicy::Bypass => "proxy",
+            RoutePolicy::OnlyVpn => "direct",
+        }
+    }
+
+    fn selected_dns_server(&self) -> &'static str {
+        match self {
+            RoutePolicy::Bypass => "dns-direct",
+            RoutePolicy::OnlyVpn => "dns-vpn",
+        }
+    }
+
+    fn final_dns_server(&self) -> &'static str {
+        match self {
+            RoutePolicy::Bypass => "dns-vpn",
+            RoutePolicy::OnlyVpn => "dns-direct",
+        }
     }
 }
 
@@ -52,6 +100,28 @@ pub struct VlessParams {
     pub alpn: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct NaiveParams {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub password: String,
+    #[allow(dead_code)]
+    pub name: String,
+    pub quic: bool,
+    pub tls_server_name: String,
+    pub insecure_concurrency: Option<u16>,
+    pub extra_headers: HashMap<String, String>,
+    pub udp_over_tcp: bool,
+    pub quic_congestion_control: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum ProxyParams {
+    Vless(VlessParams),
+    Naive(NaiveParams),
+}
+
 impl VlessParams {
     /// Выбирает VPN-ядро на основе транспорта: xhttp/splithttp → Xray, иначе sing-box.
     /// В Lite-сборке (без feature "xhttp") парсер отвергает xhttp/splithttp раньше —
@@ -60,6 +130,33 @@ impl VlessParams {
         match self.transport_type.as_str() {
             "xhttp" | "splithttp" => VpnEngine::Xray,
             _ => VpnEngine::SingBox,
+        }
+    }
+}
+
+impl ProxyParams {
+    pub fn engine(&self) -> VpnEngine {
+        match self {
+            ProxyParams::Vless(params) => params.engine(),
+            ProxyParams::Naive(_) => VpnEngine::SingBox,
+        }
+    }
+
+    pub fn server_host(&self) -> &str {
+        match self {
+            ProxyParams::Vless(params) => &params.host,
+            ProxyParams::Naive(params) => &params.host,
+        }
+    }
+
+    pub fn requires_libcronet(&self) -> bool {
+        matches!(self, ProxyParams::Naive(_))
+    }
+
+    pub fn as_vless(&self) -> Option<&VlessParams> {
+        match self {
+            ProxyParams::Vless(params) => Some(params),
+            ProxyParams::Naive(_) => None,
         }
     }
 }
@@ -104,9 +201,10 @@ fn is_valid_uuid(s: &str) -> bool {
         return false;
     }
     let expected_lens = [8, 4, 4, 4, 12];
-    parts.iter().zip(expected_lens.iter()).all(|(part, &len)| {
-        part.len() == len && part.chars().all(|c| c.is_ascii_hexdigit())
-    })
+    parts
+        .iter()
+        .zip(expected_lens.iter())
+        .all(|(part, &len)| part.len() == len && part.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 /// Допустимые значения параметра security
@@ -121,12 +219,29 @@ const ALLOWED_FLOW: &[&str] = &["", "xtls-rprx-vision"];
 /// и отклоняются с сообщением-перенаправлением на Full-версию.
 #[cfg(feature = "xhttp")]
 const ALLOWED_TRANSPORT: &[&str] = &[
-    "", "tcp", "ws", "http", "grpc", "quic", "httpupgrade", "xhttp", "splithttp",
+    "",
+    "tcp",
+    "ws",
+    "http",
+    "grpc",
+    "quic",
+    "httpupgrade",
+    "xhttp",
+    "splithttp",
 ];
 #[cfg(not(feature = "xhttp"))]
-const ALLOWED_TRANSPORT: &[&str] = &[
-    "", "tcp", "ws", "http", "grpc", "quic", "httpupgrade",
-];
+const ALLOWED_TRANSPORT: &[&str] = &["", "tcp", "ws", "http", "grpc", "quic", "httpupgrade"];
+
+pub fn parse_proxy_uri(uri: &str) -> Result<ProxyParams, String> {
+    let uri = uri.trim();
+    if uri.starts_with("vless://") {
+        return parse_vless_uri(uri).map(ProxyParams::Vless);
+    }
+    if uri.starts_with("naive+https://") || uri.starts_with("naive+quic://") {
+        return parse_naive_uri(uri).map(ProxyParams::Naive);
+    }
+    Err("неподдерживаемый URI: ожидается vless://, naive+https:// или naive+quic://".into())
+}
 
 pub fn parse_vless_uri(uri: &str) -> Result<VlessParams, String> {
     let uri = uri.trim();
@@ -149,9 +264,7 @@ pub fn parse_vless_uri(uri: &str) -> Result<VlessParams, String> {
     };
 
     // UUID @ host:port ? query
-    let (uuid, rest) = s
-        .split_once('@')
-        .ok_or("неверный формат: нет @")?;
+    let (uuid, rest) = s.split_once('@').ok_or("неверный формат: нет @")?;
 
     // Валидация UUID
     if !is_valid_uuid(uuid) {
@@ -183,7 +296,10 @@ pub fn parse_vless_uri(uri: &str) -> Result<VlessParams, String> {
     // Валидация host: должен быть IP-адрес или валидный домен
     let clean_host = host.trim_matches(|c| c == '[' || c == ']'); // IPv6 brackets
     if clean_host.parse::<IpAddr>().is_err() && !is_valid_domain(clean_host) {
-        return Err(format!("неверный хост: '{}'", if host.len() > 100 { &host[..100] } else { host }));
+        return Err(format!(
+            "неверный хост: '{}'",
+            if host.len() > 100 { &host[..100] } else { host }
+        ));
     }
 
     let params: HashMap<&str, &str> = query
@@ -236,7 +352,11 @@ pub fn parse_vless_uri(uri: &str) -> Result<VlessParams, String> {
     let alpn: Vec<String> = if alpn_raw.is_empty() {
         Vec::new()
     } else {
-        alpn_raw.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+        alpn_raw
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
     };
 
     Ok(VlessParams {
@@ -255,6 +375,183 @@ pub fn parse_vless_uri(uri: &str) -> Result<VlessParams, String> {
         transport_host: percent_decode(params.get("host").unwrap_or(&"")),
         service_name: percent_decode(params.get("serviceName").unwrap_or(&"")),
         alpn,
+    })
+}
+
+fn parse_bool_query(value: Option<&&str>) -> bool {
+    value
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+fn parse_host_port_default(hostport: &str, default_port: u16) -> Result<(String, u16), String> {
+    if hostport.is_empty() {
+        return Err("неверный формат: пустой хост".into());
+    }
+
+    let (host, port) = if let Some(rest) = hostport.strip_prefix('[') {
+        let end = rest.find(']').ok_or("неверный IPv6 host: нет ]")?;
+        let host = &rest[..end];
+        let after = &rest[end + 1..];
+        let port = if let Some(port_s) = after.strip_prefix(':') {
+            port_s
+                .parse::<u16>()
+                .map_err(|_| format!("неверный порт: {port_s}"))?
+        } else if after.is_empty() {
+            default_port
+        } else {
+            return Err("неверный host:port".into());
+        };
+        (host.to_string(), port)
+    } else if let Some((host, port_s)) = hostport.rsplit_once(':') {
+        if port_s.chars().all(|c| c.is_ascii_digit()) {
+            (
+                host.to_string(),
+                port_s
+                    .parse::<u16>()
+                    .map_err(|_| format!("неверный порт: {port_s}"))?,
+            )
+        } else {
+            (hostport.to_string(), default_port)
+        }
+    } else {
+        (hostport.to_string(), default_port)
+    };
+
+    let clean_host = host.trim_matches(|c| c == '[' || c == ']').to_string();
+    if clean_host.parse::<IpAddr>().is_err() && !is_valid_domain(&clean_host) {
+        return Err(format!(
+            "неверный хост: '{}'",
+            if clean_host.len() > 100 {
+                &clean_host[..100]
+            } else {
+                &clean_host
+            }
+        ));
+    }
+    if port == 0 {
+        return Err("порт не может быть 0".into());
+    }
+
+    Ok((clean_host, port))
+}
+
+fn parse_naive_extra_headers(raw: &str) -> Result<HashMap<String, String>, String> {
+    let decoded = percent_decode(raw);
+    let mut headers = HashMap::new();
+    if decoded.trim().is_empty() {
+        return Ok(headers);
+    }
+
+    for line in decoded.split("\r\n") {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let (name, value) = line
+            .split_once(':')
+            .ok_or("неверный naive extra-headers: ожидается Header:Value")?;
+        let name = name.trim();
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c))
+        {
+            return Err("неверный naive extra-headers: некорректное имя header".into());
+        }
+        headers.insert(name.to_string(), value.trim().to_string());
+    }
+
+    Ok(headers)
+}
+
+fn parse_naive_uri(uri: &str) -> Result<NaiveParams, String> {
+    let uri = uri.trim();
+    if uri.len() > 10240 {
+        return Err("URI слишком длинный (макс. 10 КБ)".into());
+    }
+
+    let (scheme, rest) = uri
+        .split_once("://")
+        .ok_or("неверный naive URI: нет scheme")?;
+    let quic = match scheme {
+        "naive+https" => false,
+        "naive+quic" => true,
+        _ => return Err("неподдерживаемый naive scheme".into()),
+    };
+
+    let (rest, name) = if let Some(idx) = rest.rfind('#') {
+        (&rest[..idx], percent_decode(&rest[idx + 1..]))
+    } else {
+        (rest, "без имени".into())
+    };
+    let (authority, query) = if let Some(idx) = rest.find('?') {
+        (&rest[..idx], &rest[idx + 1..])
+    } else {
+        (rest, "")
+    };
+
+    let (userinfo, hostport) = if let Some((userinfo, hostport)) = authority.rsplit_once('@') {
+        (Some(userinfo), hostport)
+    } else {
+        (None, authority)
+    };
+    let (username, password) = match userinfo {
+        Some(raw) => {
+            let (user, pass) = raw.split_once(':').unwrap_or((raw, ""));
+            (percent_decode(user), percent_decode(pass))
+        }
+        None => (String::new(), String::new()),
+    };
+    let (host, port) = parse_host_port_default(hostport, 443)?;
+
+    let params: HashMap<&str, &str> = query
+        .split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .collect();
+    let tls_server_name = params
+        .get("sni")
+        .or_else(|| params.get("server_name"))
+        .map(|v| percent_decode(v))
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| host.clone());
+    let insecure_concurrency = params
+        .get("insecure-concurrency")
+        .or_else(|| params.get("insecure_concurrency"))
+        .map(|v| {
+            v.parse::<u16>()
+                .map_err(|_| format!("неверный insecure_concurrency: {v}"))
+        })
+        .transpose()?;
+    let extra_headers = params
+        .get("extra-headers")
+        .or_else(|| params.get("extra_headers"))
+        .map(|v| parse_naive_extra_headers(v))
+        .transpose()?
+        .unwrap_or_default();
+    let udp_over_tcp = parse_bool_query(
+        params
+            .get("udp-over-tcp")
+            .or_else(|| params.get("udp_over_tcp"))
+            .or_else(|| params.get("uot")),
+    );
+    let quic_congestion_control = params
+        .get("quic-congestion-control")
+        .or_else(|| params.get("quic_congestion_control"))
+        .map(|v| percent_decode(v))
+        .unwrap_or_default();
+
+    Ok(NaiveParams {
+        host,
+        port,
+        username,
+        password,
+        name,
+        quic,
+        tls_server_name,
+        insecure_concurrency,
+        extra_headers,
+        udp_over_tcp,
+        quic_congestion_control,
     })
 }
 
@@ -294,7 +591,10 @@ pub(crate) fn is_valid_domain(s: &str) -> bool {
 pub(crate) fn normalize_entry(s: &str) -> String {
     let s = s.trim();
     // Если пользователь вставил URL вида https://example.com/path — извлекаем хост
-    let s = if let Some(rest) = s.strip_prefix("http://").or_else(|| s.strip_prefix("https://")) {
+    let s = if let Some(rest) = s
+        .strip_prefix("http://")
+        .or_else(|| s.strip_prefix("https://"))
+    {
         let host = rest.split('/').next().unwrap_or(rest);
         // Убираем порт если есть
         host.split(':').next().unwrap_or(host).to_lowercase()
@@ -302,7 +602,11 @@ pub(crate) fn normalize_entry(s: &str) -> String {
         s.trim_end_matches('/').to_lowercase()
     };
     // *.ru → ru, .ru → ru — sing-box domain_suffix и так работает как суффикс-матч
-    let s = s.strip_prefix("*.").or_else(|| s.strip_prefix('.')).unwrap_or(&s).to_string();
+    let s = s
+        .strip_prefix("*.")
+        .or_else(|| s.strip_prefix('.'))
+        .unwrap_or(&s)
+        .to_string();
     s
 }
 
@@ -316,6 +620,8 @@ fn build_route(
     bypass_apps: &[String],
     server_host: &str,
     mode: &VpnMode,
+    route_policy: &RoutePolicy,
+    block_udp: bool,
 ) -> serde_json::Value {
     let mut rules: Vec<serde_json::Value> = Vec::new();
 
@@ -323,6 +629,9 @@ fn build_route(
     if *mode == VpnMode::Tun {
         rules.push(serde_json::json!({ "action": "sniff" }));
         rules.push(serde_json::json!({ "protocol": "dns", "action": "hijack-dns" }));
+        if block_udp {
+            rules.push(serde_json::json!({ "network": "udp", "outbound": "block" }));
+        }
     }
 
     // VPN-сервер всегда идёт напрямую (предотвращает петлю в TUN-режиме)
@@ -335,25 +644,32 @@ fn build_route(
     if !norm_bypass.is_empty() {
         let (nets, domains): (Vec<_>, Vec<_>) =
             norm_bypass.iter().partition(|s| is_network_entry(s));
-        let valid_domains: Vec<_> = domains
-            .into_iter()
-            .filter(|d| is_valid_domain(d))
-            .collect();
+        let valid_domains: Vec<_> = domains.into_iter().filter(|d| is_valid_domain(d)).collect();
         if !valid_domains.is_empty() {
-            rules.push(serde_json::json!({ "outbound": "direct", "domain_suffix": valid_domains }));
+            rules.push(serde_json::json!({
+                "outbound": route_policy.selected_outbound(),
+                "domain_suffix": valid_domains
+            }));
         }
         if !nets.is_empty() {
-            rules.push(serde_json::json!({ "outbound": "direct", "ip_cidr": nets }));
+            rules.push(serde_json::json!({
+                "outbound": route_policy.selected_outbound(),
+                "ip_cidr": nets
+            }));
         }
     }
 
     // bypass apps → direct (process_name)
-    let norm_apps: Vec<String> = bypass_apps.iter()
+    let norm_apps: Vec<String> = bypass_apps
+        .iter()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
     if !norm_apps.is_empty() {
-        rules.push(serde_json::json!({ "outbound": "direct", "process_name": norm_apps }));
+        rules.push(serde_json::json!({
+            "outbound": route_policy.selected_outbound(),
+            "process_name": norm_apps
+        }));
     }
 
     if *mode == VpnMode::Tun {
@@ -363,14 +679,20 @@ fn build_route(
 
     serde_json::json!({
         "rules": rules,
-        "final": "proxy",
+        "final": route_policy.final_outbound(),
         "auto_detect_interface": true,
         "default_domain_resolver": "dns-direct"
     })
 }
 
 /// DNS конфиг. В TUN — полный с bypass-правилами, в Proxy — минимальный для резолва.
-fn build_dns(bypass: &[String], server_host: &str, mode: &VpnMode) -> serde_json::Value {
+fn build_dns(
+    bypass: &[String],
+    server_host: &str,
+    mode: &VpnMode,
+    route_policy: &RoutePolicy,
+    proxy_dns_over_tcp: bool,
+) -> serde_json::Value {
     let mut rules: Vec<serde_json::Value> = Vec::new();
 
     if *mode == VpnMode::Tun {
@@ -384,35 +706,46 @@ fn build_dns(bypass: &[String], server_host: &str, mode: &VpnMode) -> serde_json
 
         if !bypass.is_empty() {
             let norm: Vec<String> = bypass.iter().map(|s| normalize_entry(s)).collect();
-            let (_, domains): (Vec<_>, Vec<_>) =
-                norm.iter().partition(|s| is_network_entry(s));
-            let valid_domains: Vec<_> = domains
-                .into_iter()
-                .filter(|d| is_valid_domain(d))
-                .collect();
+            let (_, domains): (Vec<_>, Vec<_>) = norm.iter().partition(|s| is_network_entry(s));
+            let valid_domains: Vec<_> =
+                domains.into_iter().filter(|d| is_valid_domain(d)).collect();
             if !valid_domains.is_empty() {
                 rules.push(serde_json::json!({
                     "domain_suffix": valid_domains,
-                    "server": "dns-direct"
+                    "server": route_policy.selected_dns_server()
                 }));
             }
         }
     }
 
-    // dns-vpn: через VPN (8.8.8.8 через proxy outbound)
+    // dns-vpn: через VPN. Для Naive/TUN используем DoT, чтобы не требовать UoT на сервере.
     // dns-direct: UDP 1.1.1.1 без detour — трафик к 1.1.1.1 исключён из TUN
     // через route_exclude_address и route rule → direct outbound.
     // detour: "direct" нельзя (sing-box 1.13: "empty direct outbound"),
     // type: "local" нельзя (петля: system DNS → TUN → sing-box → system DNS).
+    let dns_vpn = if proxy_dns_over_tcp {
+        serde_json::json!({
+            "type": "tls",
+            "tag": "dns-vpn",
+            "server": "8.8.8.8",
+            "server_port": 853,
+            "detour": "proxy",
+            "tls": {
+                "server_name": "dns.google"
+            }
+        })
+    } else {
+        serde_json::json!({
+            "type": "udp",
+            "tag": "dns-vpn",
+            "server": "8.8.8.8",
+            "server_port": 53,
+            "detour": "proxy"
+        })
+    };
     serde_json::json!({
         "servers": [
-            {
-                "type": "udp",
-                "tag": "dns-vpn",
-                "server": "8.8.8.8",
-                "server_port": 53,
-                "detour": "proxy"
-            },
+            dns_vpn,
             {
                 "type": "udp",
                 "tag": "dns-direct",
@@ -422,19 +755,37 @@ fn build_dns(bypass: &[String], server_host: &str, mode: &VpnMode) -> serde_json
         ],
         "rules": rules,
         "strategy": "ipv4_only",
-        "final": "dns-vpn",
+        "final": route_policy.final_dns_server(),
         "independent_cache": true
     })
 }
 
-pub fn generate_singbox_config(
-    p: &VlessParams,
-    bypass: &[String],
-    bypass_apps: &[String],
-    mode: &VpnMode,
-    proxy_port: u16,
-    clash_secret: &str,
-) -> serde_json::Value {
+fn build_tun_route_exclude_address(server_host: &str) -> Vec<String> {
+    let mut exclude = vec!["1.1.1.1/32".to_string()];
+    if let Ok(ip) = server_host.parse::<IpAddr>() {
+        match ip {
+            IpAddr::V4(_) => exclude.insert(0, format!("{server_host}/32")),
+            IpAddr::V6(_) => exclude.insert(0, format!("{server_host}/128")),
+        }
+    }
+    exclude
+}
+
+fn build_tun_inbound(server_host: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "tun",
+        "tag": "tun-in",
+        "interface_name": "E13VPN",
+        "address": ["172.18.0.1/30", "fdfe:dcba:9876::1/126"],
+        "mtu": 1500,
+        "auto_route": true,
+        "strict_route": false,
+        "stack": "gvisor",
+        "route_exclude_address": build_tun_route_exclude_address(server_host)
+    })
+}
+
+fn build_vless_outbound(p: &VlessParams) -> serde_json::Value {
     let tls = match p.security.as_str() {
         "reality" => serde_json::json!({
             "enabled": true,
@@ -456,7 +807,7 @@ pub fn generate_singbox_config(
                 tls_obj["alpn"] = serde_json::json!(p.alpn);
             }
             tls_obj
-        },
+        }
         _ => serde_json::json!({ "enabled": false }),
     };
 
@@ -491,7 +842,12 @@ pub fn generate_singbox_config(
                 t["path"] = serde_json::Value::String(p.transport_path.clone());
             }
             if !p.transport_host.is_empty() {
-                let hosts: Vec<&str> = p.transport_host.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+                let hosts: Vec<&str> = p
+                    .transport_host
+                    .split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .collect();
                 t["host"] = serde_json::json!(hosts);
             }
             Some(t)
@@ -521,6 +877,77 @@ pub fn generate_singbox_config(
         outbound["transport"] = t;
     }
 
+    outbound
+}
+
+fn build_naive_outbound(p: &NaiveParams, mode: &VpnMode) -> serde_json::Value {
+    let mut outbound = serde_json::json!({
+        "type": "naive",
+        "tag": "proxy",
+        "server": p.host,
+        "server_port": p.port,
+        "tls": {
+            "enabled": true,
+            "server_name": p.tls_server_name
+        }
+    });
+    if *mode == VpnMode::Tun {
+        outbound["domain_resolver"] = serde_json::json!({
+            "server": "dns-direct",
+            "strategy": "ipv4_only"
+        });
+    }
+    if !p.username.is_empty() {
+        outbound["username"] = serde_json::Value::String(p.username.clone());
+    }
+    if !p.password.is_empty() {
+        outbound["password"] = serde_json::Value::String(p.password.clone());
+    }
+    if let Some(insecure_concurrency) = p.insecure_concurrency {
+        outbound["insecure_concurrency"] =
+            serde_json::Value::Number(serde_json::Number::from(insecure_concurrency));
+    }
+    if !p.extra_headers.is_empty() {
+        outbound["extra_headers"] = serde_json::json!(p.extra_headers);
+    }
+    if p.udp_over_tcp {
+        outbound["udp_over_tcp"] = serde_json::Value::Bool(true);
+    }
+    if p.quic {
+        outbound["quic"] = serde_json::Value::Bool(true);
+    }
+    if !p.quic_congestion_control.is_empty() {
+        outbound["quic_congestion_control"] =
+            serde_json::Value::String(p.quic_congestion_control.clone());
+    }
+
+    outbound
+}
+
+pub fn generate_singbox_config(
+    params: &ProxyParams,
+    bypass: &[String],
+    bypass_apps: &[String],
+    mode: &VpnMode,
+    route_policy: &RoutePolicy,
+    proxy_port: u16,
+    clash_secret: &str,
+) -> serde_json::Value {
+    let outbound = match params {
+        ProxyParams::Vless(p) => build_vless_outbound(p),
+        ProxyParams::Naive(p) => build_naive_outbound(p, mode),
+    };
+    let host = params.server_host();
+    let is_naive_tun = matches!(params, ProxyParams::Naive(_)) && *mode == VpnMode::Tun;
+    let block_udp =
+        matches!(params, ProxyParams::Naive(p) if *mode == VpnMode::Tun && !p.udp_over_tcp);
+    let mut outbounds = vec![
+        outbound,
+        serde_json::json!({ "type": "direct", "tag": "direct" }),
+    ];
+    if block_udp {
+        outbounds.push(serde_json::json!({ "type": "block", "tag": "block" }));
+    }
     let inbound = match mode {
         VpnMode::Proxy => serde_json::json!([{
             "type": "mixed",
@@ -530,11 +957,11 @@ pub fn generate_singbox_config(
         }]),
         VpnMode::Tun => {
             // IPv4 → /32, IPv6 → /128, домен → пропускаем
-            let mut exclude = vec!["1.1.1.1/32".to_string(), "2000::/3".to_string()];
-            if let Ok(ip) = p.host.parse::<IpAddr>() {
+            let mut exclude = vec!["1.1.1.1/32".to_string()];
+            if let Ok(ip) = host.parse::<IpAddr>() {
                 match ip {
-                    IpAddr::V4(_) => exclude.insert(0, format!("{}/32", p.host)),
-                    IpAddr::V6(_) => exclude.insert(0, format!("{}/128", p.host)),
+                    IpAddr::V4(_) => exclude.insert(0, format!("{host}/32")),
+                    IpAddr::V6(_) => exclude.insert(0, format!("{host}/128")),
                 }
             }
             serde_json::json!([{
@@ -548,19 +975,16 @@ pub fn generate_singbox_config(
                 "stack": "gvisor",
                 "route_exclude_address": exclude
             }])
-        },
+        }
     };
 
-    let server_host = p.host.to_lowercase();
+    let server_host = host.to_lowercase();
     let config = serde_json::json!({
         "log": { "level": "info", "timestamp": true },
-        "dns": build_dns(bypass, &server_host, mode),
+        "dns": build_dns(bypass, &server_host, mode, route_policy, is_naive_tun),
         "inbounds": inbound,
-        "outbounds": [
-            outbound,
-            { "type": "direct", "tag": "direct" }
-        ],
-        "route": build_route(bypass, bypass_apps, &server_host, mode),
+        "outbounds": outbounds,
+        "route": build_route(bypass, bypass_apps, &server_host, mode, route_policy, block_udp),
         "experimental": {
             "clash_api": {
                 "external_controller": "127.0.0.1:9090",
@@ -575,46 +999,574 @@ pub fn generate_singbox_config(
 
 /// Нормализует и валидирует запись маршрута.
 /// Возвращает (нормализованное_значение, валидно_ли).
+pub fn generate_singbox_xray_tun_router_config(
+    bypass: &[String],
+    bypass_apps: &[String],
+    server_host: &str,
+    route_policy: &RoutePolicy,
+    xray_socks_port: u16,
+) -> serde_json::Value {
+    let server_host = server_host.to_lowercase();
+    let mut router_bypass_apps = vec![
+        "xray.exe".to_string(),
+        "xray-x86_64-pc-windows-msvc.exe".to_string(),
+    ];
+    router_bypass_apps.extend(
+        bypass_apps
+            .iter()
+            .map(|app| app.trim().to_string())
+            .filter(|app| !app.is_empty()),
+    );
+
+    serde_json::json!({
+        "log": { "level": "info", "timestamp": true },
+        "dns": build_dns(bypass, &server_host, &VpnMode::Tun, route_policy, false),
+        "inbounds": [build_tun_inbound(&server_host)],
+        "outbounds": [
+            {
+                "type": "socks",
+                "tag": "proxy",
+                "server": "127.0.0.1",
+                "server_port": xray_socks_port,
+                "version": "5"
+            },
+            { "type": "direct", "tag": "direct" }
+        ],
+        "route": build_route(bypass, &router_bypass_apps, &server_host, &VpnMode::Tun, route_policy, false)
+    })
+}
+
 pub fn validate_route_entry(raw: &str) -> (String, bool) {
     let norm = normalize_entry(raw);
     let valid = !norm.is_empty() && (is_network_entry(&norm) || is_valid_domain(&norm));
     (norm, valid)
 }
 
-/// HTTP-прокси на 127.0.0.1:{port}
-pub fn set_system_proxy(enable: bool, port: u16) -> Result<(), String> {
+#[cfg(windows)]
+const INTERNET_SETTINGS_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+#[cfg(windows)]
+const PROXY_OWNERSHIP_KEY: &str = r"Software\E13VPNPlus\ProxyOwnership";
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct SystemProxySnapshot {
+    enabled: u32,
+    server: Option<String>,
+}
+
+#[cfg(windows)]
+fn system_proxy_matches_owner(snapshot: &SystemProxySnapshot, owned_server: &str) -> bool {
+    snapshot.enabled == 1 && snapshot.server.as_deref() == Some(owned_server)
+}
+
+#[cfg(windows)]
+fn notify_system_proxy_changed() {
+    unsafe {
+        use windows_sys::Win32::Networking::WinInet::{
+            InternetSetOptionA, INTERNET_OPTION_REFRESH, INTERNET_OPTION_SETTINGS_CHANGED,
+        };
+        InternetSetOptionA(
+            std::ptr::null(),
+            INTERNET_OPTION_SETTINGS_CHANGED,
+            std::ptr::null(),
+            0,
+        );
+        InternetSetOptionA(
+            std::ptr::null(),
+            INTERNET_OPTION_REFRESH,
+            std::ptr::null(),
+            0,
+        );
+    }
+}
+
+#[cfg(windows)]
+fn read_system_proxy() -> Result<SystemProxySnapshot, String> {
+    use winreg::enums::*;
+    use winreg::RegKey;
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let settings = hkcu
+        .open_subkey_with_flags(INTERNET_SETTINGS_KEY, KEY_READ)
+        .map_err(|e| format!("open system proxy settings: {e}"))?;
+    Ok(SystemProxySnapshot {
+        enabled: settings.get_value("ProxyEnable").unwrap_or(0),
+        server: settings.get_value("ProxyServer").ok(),
+    })
+}
+
+#[cfg(windows)]
+fn write_system_proxy(snapshot: &SystemProxySnapshot) -> Result<(), String> {
+    use winreg::enums::*;
+    use winreg::RegKey;
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let settings = hkcu
+        .open_subkey_with_flags(INTERNET_SETTINGS_KEY, KEY_WRITE)
+        .map_err(|e| format!("open system proxy settings for write: {e}"))?;
+    match &snapshot.server {
+        Some(server) => settings
+            .set_value("ProxyServer", server)
+            .map_err(|e| format!("restore ProxyServer: {e}"))?,
+        None => {
+            let _ = settings.delete_value("ProxyServer");
+        }
+    }
+    settings
+        .set_value("ProxyEnable", &snapshot.enabled)
+        .map_err(|e| format!("restore ProxyEnable: {e}"))?;
+    notify_system_proxy_changed();
+    Ok(())
+}
+
+/// Claims the Windows system proxy for this E13VPN+ session.
+/// The previous values are persisted so crash recovery can restore them later.
+pub fn acquire_system_proxy(port: u16) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use winreg::enums::*;
+        use winreg::RegKey;
+
+        // Recover only a proxy that a previous E13VPN+ session still owns.
+        release_system_proxy()?;
+
+        let previous = read_system_proxy()?;
+        let owned_server = format!("127.0.0.1:{port}");
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let (ownership, _) = hkcu
+            .create_subkey(PROXY_OWNERSHIP_KEY)
+            .map_err(|e| format!("create proxy ownership marker: {e}"))?;
+        ownership
+            .set_value("OwnedProxyServer", &owned_server)
+            .map_err(|e| format!("write proxy ownership marker: {e}"))?;
+        ownership
+            .set_value("PreviousProxyEnable", &previous.enabled)
+            .map_err(|e| format!("write previous ProxyEnable: {e}"))?;
+        ownership
+            .set_value(
+                "PreviousProxyServerPresent",
+                &u32::from(previous.server.is_some()),
+            )
+            .map_err(|e| format!("write previous ProxyServer marker: {e}"))?;
+        if let Some(server) = &previous.server {
+            ownership
+                .set_value("PreviousProxyServer", server)
+                .map_err(|e| format!("write previous ProxyServer: {e}"))?;
+        }
+
+        let apply_result = (|| -> Result<(), String> {
+            let settings = hkcu
+                .open_subkey_with_flags(INTERNET_SETTINGS_KEY, KEY_WRITE)
+                .map_err(|e| format!("open system proxy settings for write: {e}"))?;
+            // Write the endpoint first so ProxyEnable never points at a stale server.
+            settings
+                .set_value("ProxyServer", &owned_server)
+                .map_err(|e| format!("set ProxyServer: {e}"))?;
+            settings
+                .set_value("ProxyEnable", &1u32)
+                .map_err(|e| format!("set ProxyEnable: {e}"))?;
+            notify_system_proxy_changed();
+            Ok(())
+        })();
+
+        if let Err(error) = apply_result {
+            let _ = write_system_proxy(&previous);
+            let _ = hkcu.delete_subkey_all(PROXY_OWNERSHIP_KEY);
+            return Err(error);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = port;
+    }
+    Ok(())
+}
+
+/// Restores the proxy snapshot only while the current proxy still matches the
+/// endpoint claimed by E13VPN+. Changes made by another application are kept.
+pub fn release_system_proxy() -> Result<(), String> {
     #[cfg(windows)]
     {
         use winreg::enums::*;
         use winreg::RegKey;
 
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-        let path = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
-        let settings = hkcu
-            .open_subkey_with_flags(path, KEY_WRITE)
-            .map_err(|e| e.to_string())?;
-
-        if enable {
-            settings
-                .set_value("ProxyEnable", &1u32)
-                .map_err(|e| e.to_string())?;
-            settings
-                .set_value("ProxyServer", &format!("127.0.0.1:{}", port))
-                .map_err(|e| e.to_string())?;
+        let ownership = match hkcu.open_subkey_with_flags(PROXY_OWNERSHIP_KEY, KEY_READ) {
+            Ok(key) => key,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(format!("open proxy ownership marker: {error}")),
+        };
+        let owned_server: String = ownership
+            .get_value("OwnedProxyServer")
+            .map_err(|e| format!("read proxy ownership marker: {e}"))?;
+        let previous_enabled: u32 = ownership
+            .get_value("PreviousProxyEnable")
+            .map_err(|e| format!("read previous ProxyEnable: {e}"))?;
+        let previous_server_present: u32 = ownership
+            .get_value("PreviousProxyServerPresent")
+            .unwrap_or(0);
+        let previous_server = if previous_server_present == 1 {
+            Some(
+                ownership
+                    .get_value("PreviousProxyServer")
+                    .map_err(|e| format!("read previous ProxyServer: {e}"))?,
+            )
         } else {
-            settings
-                .set_value("ProxyEnable", &0u32)
-                .map_err(|e| e.to_string())?;
-        }
+            None
+        };
+        drop(ownership);
 
-        // Уведомляем WinINet — без этого Chrome/Edge не подхватывают смену прокси
-        unsafe {
-            use windows_sys::Win32::Networking::WinInet::{
-                InternetSetOptionA, INTERNET_OPTION_REFRESH, INTERNET_OPTION_SETTINGS_CHANGED,
-            };
-            InternetSetOptionA(std::ptr::null(), INTERNET_OPTION_SETTINGS_CHANGED, std::ptr::null(), 0);
-            InternetSetOptionA(std::ptr::null(), INTERNET_OPTION_REFRESH, std::ptr::null(), 0);
+        let current = read_system_proxy()?;
+        if system_proxy_matches_owner(&current, &owned_server) {
+            write_system_proxy(&SystemProxySnapshot {
+                enabled: previous_enabled,
+                server: previous_server,
+            })?;
         }
+        hkcu.delete_subkey_all(PROXY_OWNERSHIP_KEY)
+            .map_err(|e| format!("remove proxy ownership marker: {e}"))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xray_tun_router_uses_singbox_tun_and_xray_socks_outbound() {
+        let cfg = generate_singbox_xray_tun_router_config(
+            &["ru".to_string()],
+            &["chrome.exe".to_string()],
+            "194.62.248.33",
+            &RoutePolicy::Bypass,
+            51252,
+        );
+
+        assert_eq!(cfg["inbounds"][0]["type"], "tun");
+        assert_eq!(cfg["inbounds"][0]["interface_name"], "E13VPN");
+        assert_eq!(cfg["outbounds"][0]["type"], "socks");
+        assert_eq!(cfg["outbounds"][0]["server"], "127.0.0.1");
+        assert_eq!(cfg["outbounds"][0]["server_port"], 51252);
+        assert_eq!(cfg["outbounds"][0]["version"], "5");
+        assert_eq!(cfg["route"]["final"], "proxy");
+    }
+
+    #[test]
+    fn xray_tun_router_preserves_route_and_dns_bypass_rules() {
+        let cfg = generate_singbox_xray_tun_router_config(
+            &["ru".to_string(), "10.0.0.0/8".to_string()],
+            &[],
+            "example.com",
+            &RoutePolicy::Bypass,
+            51252,
+        );
+
+        let route_rules = cfg["route"]["rules"].as_array().expect("route rules");
+        assert!(route_rules.iter().any(|rule| {
+            rule["domain_suffix"]
+                .as_array()
+                .is_some_and(|domains| domains.iter().any(|d| d == "ru"))
+        }));
+        assert!(route_rules.iter().any(|rule| {
+            rule["ip_cidr"]
+                .as_array()
+                .is_some_and(|nets| nets.iter().any(|net| net == "10.0.0.0/8"))
+        }));
+
+        let dns_rules = cfg["dns"]["rules"].as_array().expect("dns rules");
+        assert!(dns_rules.iter().any(|rule| {
+            rule["domain_suffix"]
+                .as_array()
+                .is_some_and(|domains| domains.iter().any(|d| d == "ru"))
+                && rule["server"] == "dns-direct"
+        }));
+    }
+
+    #[test]
+    fn xray_tun_router_excludes_server_ip_from_auto_route() {
+        let cfg = generate_singbox_xray_tun_router_config(
+            &[],
+            &[],
+            "194.62.248.33",
+            &RoutePolicy::Bypass,
+            51252,
+        );
+
+        let excludes = cfg["inbounds"][0]["route_exclude_address"]
+            .as_array()
+            .expect("route excludes");
+        assert!(excludes.iter().any(|entry| entry == "194.62.248.33/32"));
+        assert!(excludes.iter().any(|entry| entry == "1.1.1.1/32"));
+        assert!(!excludes.iter().any(|entry| entry == "2000::/3"));
+    }
+
+    #[test]
+    fn only_vpn_policy_routes_selected_entries_to_proxy_and_defaults_direct() {
+        let cfg = generate_singbox_xray_tun_router_config(
+            &["example.com".to_string(), "203.0.113.0/24".to_string()],
+            &["chrome.exe".to_string()],
+            "194.62.248.33",
+            &RoutePolicy::OnlyVpn,
+            51252,
+        );
+
+        assert_eq!(cfg["route"]["final"], "direct");
+        let rules = cfg["route"]["rules"].as_array().expect("route rules");
+        assert!(rules.iter().any(|rule| {
+            rule["domain_suffix"]
+                .as_array()
+                .is_some_and(|domains| domains.iter().any(|d| d == "example.com"))
+                && rule["outbound"] == "proxy"
+        }));
+        assert!(rules.iter().any(|rule| {
+            rule["ip_cidr"]
+                .as_array()
+                .is_some_and(|nets| nets.iter().any(|net| net == "203.0.113.0/24"))
+                && rule["outbound"] == "proxy"
+        }));
+        assert!(rules.iter().any(|rule| {
+            rule["process_name"]
+                .as_array()
+                .is_some_and(|apps| apps.iter().any(|app| app == "chrome.exe"))
+                && rule["outbound"] == "proxy"
+        }));
+        assert_eq!(cfg["dns"]["final"], "dns-direct");
+    }
+
+    #[test]
+    fn parse_naive_https_uri_with_auth_headers_and_name() {
+        let params = parse_proxy_uri(
+            "naive+https://user:p%40ss@example.com:443?extra-headers=X-Test%3Aone%0D%0AX-Mode%3Atwo#Naive%20Server",
+        )
+        .expect("parse naive uri");
+        let ProxyParams::Naive(naive) = params else {
+            panic!("expected naive params");
+        };
+
+        assert_eq!(naive.host, "example.com");
+        assert_eq!(naive.port, 443);
+        assert_eq!(naive.username, "user");
+        assert_eq!(naive.password, "p@ss");
+        assert!(!naive.quic);
+        assert_eq!(naive.name, "Naive Server");
+        assert_eq!(
+            naive
+                .extra_headers
+                .get("X-Test")
+                .map(std::string::String::as_str),
+            Some("one")
+        );
+        assert_eq!(
+            naive
+                .extra_headers
+                .get("X-Mode")
+                .map(std::string::String::as_str),
+            Some("two")
+        );
+    }
+
+    #[test]
+    fn parse_naive_quic_uri_defaults_port_and_enables_quic() {
+        let params =
+            parse_proxy_uri("naive+quic://quic.example.com#QUIC").expect("parse naive uri");
+        let ProxyParams::Naive(naive) = params else {
+            panic!("expected naive params");
+        };
+
+        assert_eq!(naive.host, "quic.example.com");
+        assert_eq!(naive.port, 443);
+        assert!(naive.quic);
+        assert_eq!(naive.name, "QUIC");
+    }
+
+    #[test]
+    fn naive_singbox_config_uses_naive_outbound_and_tls() {
+        let params =
+            parse_proxy_uri("naive+https://user:pass@example.com:8443?sni=front.example#naive")
+                .expect("parse naive uri");
+        let cfg = generate_singbox_config(
+            &params,
+            &[],
+            &[],
+            &VpnMode::Proxy,
+            &RoutePolicy::Bypass,
+            2080,
+            "secret",
+        );
+
+        let outbound = &cfg["outbounds"][0];
+        assert_eq!(outbound["type"], "naive");
+        assert_eq!(outbound["tag"], "proxy");
+        assert_eq!(outbound["server"], "example.com");
+        assert_eq!(outbound["server_port"], 8443);
+        assert_eq!(outbound["username"], "user");
+        assert_eq!(outbound["password"], "pass");
+        assert_eq!(outbound["tls"]["enabled"], true);
+        assert_eq!(outbound["tls"]["server_name"], "front.example");
+    }
+
+    #[test]
+    fn naive_proxy_config_keeps_udp_over_tcp_disabled_by_default() {
+        let params =
+            parse_proxy_uri("naive+https://user:pass@example.com#naive").expect("parse naive uri");
+        let cfg = generate_singbox_config(
+            &params,
+            &[],
+            &[],
+            &VpnMode::Proxy,
+            &RoutePolicy::Bypass,
+            2080,
+            "secret",
+        );
+
+        let outbound = &cfg["outbounds"][0];
+        assert_eq!(outbound["type"], "naive");
+        assert!(outbound.get("udp_over_tcp").is_none());
+        assert!(outbound.get("domain_resolver").is_none());
+    }
+
+    #[test]
+    fn naive_tun_config_without_uot_uses_dot_and_blocks_udp() {
+        let params =
+            parse_proxy_uri("naive+https://user:pass@example.com#naive").expect("parse naive uri");
+        let cfg = generate_singbox_config(
+            &params,
+            &[],
+            &[],
+            &VpnMode::Tun,
+            &RoutePolicy::Bypass,
+            2080,
+            "secret",
+        );
+
+        let outbound = &cfg["outbounds"][0];
+        assert_eq!(outbound["type"], "naive");
+        assert!(outbound.get("udp_over_tcp").is_none());
+        assert_eq!(outbound["domain_resolver"]["server"], "dns-direct");
+        assert_eq!(outbound["domain_resolver"]["strategy"], "ipv4_only");
+
+        let dns_vpn = cfg["dns"]["servers"]
+            .as_array()
+            .expect("dns servers")
+            .iter()
+            .find(|server| server["tag"] == "dns-vpn")
+            .expect("dns-vpn server");
+        assert_eq!(dns_vpn["type"], "tls");
+        assert_eq!(dns_vpn["server"], "8.8.8.8");
+        assert_eq!(dns_vpn["server_port"], 853);
+        assert_eq!(dns_vpn["detour"], "proxy");
+
+        let rules = cfg["route"]["rules"].as_array().expect("route rules");
+        assert!(rules
+            .iter()
+            .any(|rule| rule["network"] == "udp" && rule["outbound"] == "block"));
+        assert!(cfg["outbounds"]
+            .as_array()
+            .expect("outbounds")
+            .iter()
+            .any(|outbound| outbound["tag"] == "block" && outbound["type"] == "block"));
+        let excludes = cfg["inbounds"][0]["route_exclude_address"]
+            .as_array()
+            .expect("route excludes");
+        assert!(!excludes.iter().any(|entry| entry == "2000::/3"));
+    }
+
+    #[test]
+    fn naive_tun_config_with_explicit_uot_enables_udp_and_does_not_block_udp() {
+        let params = parse_proxy_uri("naive+https://user:pass@example.com?uot=1#naive")
+            .expect("parse naive uri");
+        let cfg = generate_singbox_config(
+            &params,
+            &[],
+            &[],
+            &VpnMode::Tun,
+            &RoutePolicy::Bypass,
+            2080,
+            "secret",
+        );
+
+        let outbound = &cfg["outbounds"][0];
+        assert_eq!(outbound["type"], "naive");
+        assert_eq!(outbound["udp_over_tcp"], true);
+
+        let rules = cfg["route"]["rules"].as_array().expect("route rules");
+        assert!(!rules
+            .iter()
+            .any(|rule| rule["network"] == "udp" && rule["outbound"] == "block"));
+        assert!(!cfg["outbounds"]
+            .as_array()
+            .expect("outbounds")
+            .iter()
+            .any(|outbound| outbound["tag"] == "block"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn generated_naive_tun_config_is_accepted_by_bundled_singbox() {
+        let params =
+            parse_proxy_uri("naive+https://user:pass@example.com#naive").expect("parse naive URI");
+        let cfg = generate_singbox_config(
+            &params,
+            &[],
+            &[],
+            &VpnMode::Tun,
+            &RoutePolicy::Bypass,
+            2080,
+            "test-secret",
+        );
+        let binary = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("binaries")
+            .join("sing-box-x86_64-pc-windows-msvc.exe");
+        assert!(binary.exists(), "bundled sing-box binary is missing");
+
+        let config_path = std::env::temp_dir().join(format!(
+            "e13vpn-singbox-config-check-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &config_path,
+            serde_json::to_vec_pretty(&cfg).expect("serialize sing-box config"),
+        )
+        .expect("write sing-box config");
+        let output = std::process::Command::new(binary)
+            .args(["check", "-c"])
+            .arg(&config_path)
+            .output()
+            .expect("run sing-box config check");
+        let _ = std::fs::remove_file(&config_path);
+
+        assert!(
+            output.status.success(),
+            "sing-box rejected generated config: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn system_proxy_ownership_requires_exact_enabled_endpoint() {
+        let owned = "127.0.0.1:2080";
+        assert!(system_proxy_matches_owner(
+            &SystemProxySnapshot {
+                enabled: 1,
+                server: Some(owned.to_string()),
+            },
+            owned,
+        ));
+        assert!(!system_proxy_matches_owner(
+            &SystemProxySnapshot {
+                enabled: 1,
+                server: Some("127.0.0.1:7890".to_string()),
+            },
+            owned,
+        ));
+        assert!(!system_proxy_matches_owner(
+            &SystemProxySnapshot {
+                enabled: 0,
+                server: Some(owned.to_string()),
+            },
+            owned,
+        ));
+    }
 }

@@ -19,14 +19,23 @@ export function LogsScreen({ logLines }: LogsScreenProps) {
 
   return (
     <div
-      ref={logRef}
       style={{
         flex: 1,
-        overflowY: "auto",
-        padding: "8px 12px",
+        display: "flex",
+        flexDirection: "column",
+        overflow: "hidden",
         background: "var(--color-titlebar)",
       }}
     >
+      <div
+        ref={logRef}
+        style={{
+          flex: 1,
+          overflowY: "auto",
+          padding: "8px 12px",
+          userSelect: "text",
+        }}
+      >
       {logLines.length === 0 ? (
         <div
           style={{
@@ -60,6 +69,7 @@ export function LogsScreen({ logLines }: LogsScreenProps) {
           </div>
         ))
       )}
+      </div>
     </div>
   );
 }
