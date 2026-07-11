@@ -2,14 +2,12 @@ import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { readText } from "@tauri-apps/plugin-clipboard-manager";
-import { load as loadStore, Store } from "@tauri-apps/plugin-store";
 import { PowerButton } from "./PowerButton";
 import { SpeedDisplay } from "./SpeedDisplay";
 import { ModeSelector } from "./ModeSelector";
 import { ConfigList, VlessConfig } from "./ConfigList";
 import { useT } from "../i18n";
-
-const STORE_FILE = "vpn.json";
+import { getVpnStore, queueVpnStoreSave } from "../store";
 
 interface StoredConfig {
   id: string;
@@ -116,7 +114,7 @@ export function VpnScreen({
   const [connectTime, setConnectTime] = useState<number | null>(null);
   const [elapsed, setElapsed] = useState("—");
   const [reconnecting, setReconnecting] = useState(false);
-  const storeRef = useRef<Store | null>(null);
+  const [importStatus, setImportStatus] = useState("");
   const manualDisconnect = useRef(false);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectAttempt = useRef(0);
@@ -138,7 +136,7 @@ export function VpnScreen({
   const clashApiRef = useRef<ClashApiState>({ enabled: false, secret: "", port: 9090 });
 
   async function startConfig(cfg: VlessConfig, source: "manual" | "auto-reconnect" | "auto-start") {
-    const store = storeRef.current ?? await loadStore(STORE_FILE, { autoSave: false, defaults: {} });
+    const store = await getVpnStore();
     const bypassVpn = (await store.get<string[]>("routes_bypass")) ?? [];
     const bypassApps = (await store.get<string[]>("routes_bypass_apps")) ?? [];
     const routePolicy = (await store.get<RoutePolicy>("routes_policy")) ?? "bypass";
@@ -191,8 +189,7 @@ export function VpnScreen({
 
   // Load store
   useEffect(() => {
-    loadStore(STORE_FILE, { autoSave: false, defaults: {} }).then(async (store) => {
-      storeRef.current = store;
+    getVpnStore().then(async (store) => {
       // Try encrypted format first, fallback to legacy plaintext
       const storedEncrypted = await store.get<StoredConfig[]>("configs_encrypted");
       const legacyConfigs = await store.get<VlessConfig[]>("configs");
@@ -202,9 +199,10 @@ export function VpnScreen({
       } else if (legacyConfigs && legacyConfigs.length > 0) {
         // Migrate: encrypt and save, then remove plaintext
         loadedConfigs = legacyConfigs;
-        await store.set("configs_encrypted", await encryptConfigs(legacyConfigs));
-        await store.delete("configs");
-        await store.save();
+        await queueVpnStoreSave(async (queuedStore) => {
+          await queuedStore.set("configs_encrypted", await encryptConfigs(legacyConfigs));
+          await queuedStore.delete("configs");
+        });
       }
       const savedActiveId = (await store.get<string>("activeId")) ?? null;
       const savedMode = (await store.get<"proxy" | "tun">("vpn_mode")) ?? "proxy";
@@ -264,6 +262,40 @@ export function VpnScreen({
 
   // Sing-box events
   useEffect(() => {
+    function scheduleReconnect() {
+      if (!autoReconnect || manualDisconnect.current) return;
+      const attempt = reconnectAttempt.current;
+      if (attempt >= MAX_RECONNECT_ATTEMPTS) {
+        setLogLines((prev) => [
+          ...prev,
+          `[auto-reconnect] gave up after ${MAX_RECONNECT_ATTEMPTS} attempts`,
+        ]);
+        reconnectAttempt.current = 0;
+        setReconnecting(false);
+        return;
+      }
+
+      const delay = Math.min(3000 * Math.pow(2, attempt), 60000);
+      reconnectAttempt.current = attempt + 1;
+      setReconnecting(true);
+      setLogLines((prev) => [
+        ...prev,
+        `[auto-reconnect] attempt ${attempt + 1}/${MAX_RECONNECT_ATTEMPTS} in ${Math.round(delay / 1000)}s...`,
+      ]);
+      reconnectTimer.current = setTimeout(async () => {
+        setReconnecting(false);
+        if (manualDisconnect.current) return;
+        const cfg = configsRef.current.find((c) => c.id === activeIdRef.current);
+        if (!cfg) return;
+        try {
+          await startConfig(cfg, "auto-reconnect");
+        } catch (err) {
+          setLogLines((prev) => [...prev, `[auto-reconnect] failed: ${String(err)}`]);
+          scheduleReconnect();
+        }
+      }, delay);
+    }
+
     const unlistenLog = listen<string>("singbox-log", (e) => {
       setLogLines((prev) => {
         const next = [...prev, e.payload];
@@ -284,29 +316,7 @@ export function VpnScreen({
         if (uptime > 10000) {
           reconnectAttempt.current = 0;
         }
-        const attempt = reconnectAttempt.current;
-        if (attempt >= MAX_RECONNECT_ATTEMPTS) {
-          setLogLines((prev) => [...prev, `[auto-reconnect] gave up after ${MAX_RECONNECT_ATTEMPTS} attempts`]);
-          reconnectAttempt.current = 0;
-        } else {
-          const delay = Math.min(3000 * Math.pow(2, attempt), 60000); // 3s, 6s, 12s, 24s, 48s, 60s max
-          reconnectAttempt.current = attempt + 1;
-          setReconnecting(true);
-          setLogLines((prev) => [...prev, `[auto-reconnect] attempt ${attempt + 1}/${MAX_RECONNECT_ATTEMPTS} in ${Math.round(delay / 1000)}s...`]);
-          reconnectTimer.current = setTimeout(() => {
-            setReconnecting(false);
-            const doReconnect = async () => {
-              const cfg = configsRef.current.find((c) => c.id === activeIdRef.current);
-              if (!cfg) return;
-              try {
-                await startConfig(cfg, "auto-reconnect");
-              } catch (err) {
-                setLogLines((prev) => [...prev, `[auto-reconnect] failed: ${String(err)}`]);
-              }
-            };
-            doReconnect();
-          }, delay);
-        }
+        scheduleReconnect();
       }
       manualDisconnect.current = false;
     });
@@ -319,14 +329,14 @@ export function VpnScreen({
 
   // Save on change
   useEffect(() => {
-    if (!storeReady || !storeRef.current) return;
-    const store = storeRef.current;
-    (async () => {
+    if (!storeReady) return;
+    void queueVpnStoreSave(async (store) => {
       await store.set("configs_encrypted", await encryptConfigs(configs));
       await store.set("activeId", activeId);
       await store.set("vpn_mode", vpnMode);
-      await store.save();
-    })();
+    }).catch((error) => {
+      setLogLines((prev) => [...prev, `[store] save failed: ${String(error)}`]);
+    });
   }, [configs, activeId, vpnMode, storeReady]);
 
   // Auto-connect only when the app was launched by the Windows autostart entry.
@@ -385,12 +395,20 @@ export function VpnScreen({
   }
 
   async function addFromClipboard() {
+    if (!storeReady) {
+      setImportStatus(t("vpn.store_loading"));
+      return;
+    }
     try {
       const text = (await readText()).trim();
-      if (!text) return;
+      if (!text) {
+        setImportStatus(t("vpn.clipboard_empty"));
+        return;
+      }
 
       if (isSupportedConfigUri(text)) {
         const added = appendConfigUris([text]);
+        setImportStatus(added > 0 ? t("vpn.server_added") : t("vpn.server_exists"));
         setLogLines((prev) => [
           ...prev,
           added > 0 ? "[import] added 1 server" : "[import] server already exists",
@@ -399,6 +417,7 @@ export function VpnScreen({
       }
 
       if (isSubscriptionUrl(text)) {
+        setImportStatus(t("vpn.subscription_loading"));
         setLogLines((prev) => [...prev, "[subscription] downloading..."]);
         const result = await invoke<SubscriptionImportResult>("import_subscription_url", { url: text });
         const added = appendConfigUris(result.configs);
@@ -406,12 +425,19 @@ export function VpnScreen({
         const message = result.configs.length > 0
           ? `[subscription] imported ${added}/${result.configs.length} servers${skipped}`
           : `[subscription] no supported servers found${skipped}`;
+        setImportStatus(
+          result.configs.length > 0
+            ? `${t("vpn.subscription_imported")}: ${added}/${result.configs.length}`
+            : t("vpn.subscription_empty")
+        );
         setLogLines((prev) => [...prev, message]);
         return;
       }
 
+      setImportStatus(t("vpn.clipboard_unsupported"));
       setLogLines((prev) => [...prev, "[import] unsupported clipboard format"]);
     } catch (err) {
+      setImportStatus(`${t("vpn.import_failed")}: ${String(err)}`);
       setLogLines((prev) => [...prev, `[subscription] failed: ${String(err)}`]);
     }
   }
@@ -445,6 +471,7 @@ export function VpnScreen({
     const cfg = configs.find((c) => c.id === activeId)!;
     try {
       if (!connected) {
+        manualDisconnect.current = false;
         setBusy("connecting");
         setLogLines([]);
         await startConfig(cfg, "manual");
@@ -457,7 +484,9 @@ export function VpnScreen({
         markDisconnected();
       }
     } catch (e) {
-      setLogLines((prev) => [...prev, `[error] ${String(e)}`]);
+      if (!String(e).includes("connection cancelled")) {
+        setLogLines((prev) => [...prev, `[error] ${String(e)}`]);
+      }
     } finally {
       setBusy(false);
     }
@@ -522,6 +551,8 @@ export function VpnScreen({
           onSelect={setActiveId}
           onRemove={removeConfig}
           onPaste={addFromClipboard}
+          pasteDisabled={!storeReady}
+          status={importStatus}
         />
       </div>
     </div>

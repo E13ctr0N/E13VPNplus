@@ -3,7 +3,7 @@ mod vpn;
 mod vpn_xray;
 
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Mutex,
 };
 use std::time::{Duration, Instant};
@@ -99,6 +99,8 @@ const EXPECTED_SINGBOX_SHA256: &str =
     "6325205ff2dd0a3046edbad492714621a4f5af80a0a18c915a5976fa07e9c377";
 const EXPECTED_LIBCRONET_SHA256: &str =
     "8ef1f8bbde77f954af1ae47bee1819ac8dc2354bb0e1d4baba3dad9e58d7a6f7";
+const EXPECTED_WINTUN_SHA256: &str =
+    "e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce";
 
 // Xray-core v26.3.27 (downloaded via scripts/get-xray.ps1)
 const EXPECTED_XRAY_SHA256: &str =
@@ -108,6 +110,12 @@ const XRAY_BINARY_NAME: &str = "xray-x86_64-pc-windows-msvc.exe";
 const TUN2SOCKS_BINARY_NAME: &str = "tun2socks-x86_64-pc-windows-msvc.exe";
 const SINGBOX_BINARY_NAME: &str = "sing-box-x86_64-pc-windows-msvc.exe";
 const LIBCRONET_BINARY_NAME: &str = "libcronet.dll";
+
+#[derive(Debug, Clone, Copy)]
+struct OwnedBypassRoute {
+    server_ip: std::net::Ipv4Addr,
+    gateway: std::net::Ipv4Addr,
+}
 
 struct VpnState {
     process: Mutex<Option<CommandChild>>,
@@ -119,11 +127,13 @@ struct VpnState {
     mode: Mutex<vpn::VpnMode>,
     proxy_port: Mutex<u16>,
     clash_secret: Mutex<String>,
-    last_command: Mutex<Instant>,
     last_tun_stop: Mutex<Option<Instant>>,
+    operation_lock: tokio::sync::Mutex<()>,
+    session_generation: AtomicU64,
+    ready_session: AtomicU64,
     /// IP сервера для которого добавлен bypass-route через real gateway (Xray+TUN).
     /// None если маршрут не добавлялся.
-    bypass_route_ip: Mutex<Option<std::net::Ipv4Addr>>,
+    bypass_route_ip: Mutex<Option<OwnedBypassRoute>>,
 }
 
 const DYNAMIC_PORT_START: u16 = 49152;
@@ -193,14 +203,14 @@ fn ensure_fixed_proxy_ports_available(
 }
 
 fn mark_system_proxy_owned(port: u16) -> Result<(), String> {
-    vpn::set_system_proxy(true, port)?;
+    vpn::acquire_system_proxy(port)?;
     SYSTEM_PROXY_OWNED.store(true, Ordering::SeqCst);
     Ok(())
 }
 
-fn clear_owned_system_proxy(port: u16) {
+fn clear_owned_system_proxy(_port: u16) {
     if SYSTEM_PROXY_OWNED.swap(false, Ordering::SeqCst) {
-        let _ = vpn::set_system_proxy(false, port);
+        let _ = vpn::release_system_proxy();
     }
 }
 
@@ -337,12 +347,50 @@ fn verify_singbox_binary(path: &std::path::Path) -> Result<(), String> {
     verify_binary_sha256(path, EXPECTED_SINGBOX_SHA256, "sing-box")
 }
 
-fn verify_libcronet_binary(path: &std::path::Path) -> Result<(), String> {
-    verify_binary_sha256(path, EXPECTED_LIBCRONET_SHA256, "libcronet.dll")
-}
-
 fn verify_xray_binary(path: &std::path::Path) -> Result<(), String> {
     verify_binary_sha256(path, EXPECTED_XRAY_SHA256, "xray")
+}
+
+fn refresh_verified_runtime_file(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+    expected_hash: &str,
+    label: &str,
+) -> Result<(), String> {
+    verify_binary_sha256(source, expected_hash, label)?;
+    if source == destination {
+        return Ok(());
+    }
+
+    let temp = destination.with_extension("e13tmp");
+    let _ = std::fs::remove_file(&temp);
+    std::fs::copy(source, &temp).map_err(|e| format!("copy {label} to runtime temp: {e}"))?;
+    verify_binary_sha256(&temp, expected_hash, label).inspect_err(|_| {
+        let _ = std::fs::remove_file(&temp);
+    })?;
+    if destination.exists() {
+        std::fs::remove_file(destination)
+            .map_err(|e| format!("replace existing runtime {label}: {e}"))?;
+    }
+    std::fs::rename(&temp, destination).map_err(|e| format!("activate runtime {label}: {e}"))?;
+    verify_binary_sha256(destination, expected_hash, label)
+}
+
+fn cleanup_runtime_config_files(data_dir: &std::path::Path) {
+    for filename in ["singbox.json", "xray.json", "xray-singbox-router.json"] {
+        let _ = std::fs::remove_file(data_dir.join(filename));
+    }
+}
+
+fn remove_loaded_runtime_config(app: &AppHandle, path: &std::path::Path) {
+    if let Err(error) = std::fs::remove_file(path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            let _ = app.emit(
+                "singbox-log",
+                format!("[warn] runtime config cleanup failed: {error}"),
+            );
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -375,16 +423,16 @@ fn is_elevated() -> bool {
     true
 }
 
-fn check_rate_limit(state: &VpnState) -> Result<(), String> {
-    let mut last = state.last_command.lock().unwrap_or_else(|e| e.into_inner());
-    if last.elapsed() < Duration::from_millis(500) {
-        return Err("too frequent commands".into());
+fn ensure_current_session(state: &VpnState, session_id: u64) -> Result<(), String> {
+    if state.session_generation.load(Ordering::SeqCst) != session_id {
+        cleanup_vpn(state);
+        return Err("connection cancelled".into());
     }
-    *last = Instant::now();
     Ok(())
 }
 
 fn cleanup_vpn(state: &VpnState) {
+    state.ready_session.store(0, Ordering::SeqCst);
     // Stop helper first so TUN routes go away before the primary core exits.
     let helper_pid = state
         .pid_helper
@@ -423,8 +471,8 @@ fn cleanup_vpn(state: &VpnState) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .take();
-    if let Some(ip) = bypass_ip {
-        remove_server_bypass_route(ip);
+    if let Some(route) = bypass_ip {
+        let _ = remove_server_bypass_route(route);
     }
 }
 
@@ -485,6 +533,7 @@ async fn attempt_start_engine(
     app: &AppHandle,
     state: &State<'_, VpnState>,
     ctx: &PrimaryEngineCtx<'_>,
+    session_id: u64,
 ) -> StartOutcome {
     let mut cmd = match app.shell().sidecar(ctx.sidecar_name()) {
         Ok(c) => c.args(["run", "-c", ctx.config_str]),
@@ -568,9 +617,15 @@ async fn attempt_start_engine(
                         let _ = tx.send(false);
                     }
                     // Очищаем state только если PID совпадает (защита от race при retry).
+                    let mut should_emit_terminated = false;
                     if let Some(st) = app_clone.try_state::<VpnState>() {
                         let current_pid = *st.pid.lock().unwrap_or_else(|e| e.into_inner());
                         if current_pid == Some(expected_pid) {
+                            should_emit_terminated = st
+                                .ready_session
+                                .compare_exchange(session_id, 0, Ordering::SeqCst, Ordering::SeqCst)
+                                .is_ok()
+                                && st.session_generation.load(Ordering::SeqCst) == session_id;
                             let port = *st.proxy_port.lock().unwrap_or_else(|e| e.into_inner());
                             clear_owned_system_proxy(port);
                             let _ = st.process.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -594,12 +649,14 @@ async fn attempt_start_engine(
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner())
                                 .take();
-                            if let Some(ip) = bypass_ip {
-                                remove_server_bypass_route(ip);
+                            if let Some(route) = bypass_ip {
+                                let _ = remove_server_bypass_route(route);
                             }
                         }
                     }
-                    let _ = app_clone.emit("singbox-terminated", terminate_msg_fn(status.code));
+                    if should_emit_terminated {
+                        let _ = app_clone.emit("singbox-terminated", terminate_msg_fn(status.code));
+                    }
                     break;
                 }
                 _ => {}
@@ -764,33 +821,78 @@ fn detect_default_gateway() -> Result<std::net::Ipv4Addr, String> {
 /// Добавляет маршрут к IP сервера через реальный gateway (в обход TUN).
 /// Без этого маршрута TUN перехватывает трафик к серверу и создаёт петлю.
 #[cfg(windows)]
-fn add_server_bypass_route(server_ip: std::net::Ipv4Addr, gateway: std::net::Ipv4Addr) {
+fn add_server_bypass_route(
+    server_ip: std::net::Ipv4Addr,
+    gateway: std::net::Ipv4Addr,
+) -> Result<OwnedBypassRoute, String> {
     use std::os::windows::process::CommandExt;
     let ip_str = server_ip.to_string();
     let gw_str = gateway.to_string();
-    let _ = std::process::Command::new("route")
+    let output = std::process::Command::new("route")
         .args(["add", &ip_str, "mask", "255.255.255.255", &gw_str])
         .creation_flags(0x08000000)
-        .output();
+        .output()
+        .map_err(|e| format!("route add {server_ip} via {gateway}: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!("route add {server_ip} via {gateway} failed")
+        } else {
+            format!("route add {server_ip} via {gateway} failed: {stderr}")
+        });
+    }
+    Ok(OwnedBypassRoute { server_ip, gateway })
 }
 
 #[cfg(not(windows))]
-fn add_server_bypass_route(_server_ip: std::net::Ipv4Addr, _gateway: std::net::Ipv4Addr) {}
+fn add_server_bypass_route(
+    server_ip: std::net::Ipv4Addr,
+    gateway: std::net::Ipv4Addr,
+) -> Result<OwnedBypassRoute, String> {
+    Ok(OwnedBypassRoute { server_ip, gateway })
+}
 
 /// Удаляет ранее добавленный bypass-route. Вызывается в cleanup_vpn/stop_vpn.
-fn remove_server_bypass_route(server_ip: std::net::Ipv4Addr) {
+fn remove_server_bypass_route(route: OwnedBypassRoute) -> Result<(), String> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        let _ = std::process::Command::new("route")
-            .args(["delete", &server_ip.to_string()])
+        let output = std::process::Command::new("route")
+            .args([
+                "delete",
+                &route.server_ip.to_string(),
+                "mask",
+                "255.255.255.255",
+                &route.gateway.to_string(),
+            ])
             .creation_flags(0x08000000)
-            .output();
+            .output()
+            .map_err(|e| {
+                format!(
+                    "route delete {} via {}: {e}",
+                    route.server_ip, route.gateway
+                )
+            })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(if stderr.is_empty() {
+                format!(
+                    "route delete {} via {} failed",
+                    route.server_ip, route.gateway
+                )
+            } else {
+                format!(
+                    "route delete {} via {} failed: {stderr}",
+                    route.server_ip, route.gateway
+                )
+            });
+        }
     }
     #[cfg(not(windows))]
     {
-        let _ = server_ip;
+        let _ = route;
     }
+    Ok(())
 }
 
 /// Конфигурирует TUN-интерфейс после запуска tun2socks: IP, DNS, default route.
@@ -906,6 +1008,7 @@ async fn attempt_start_singbox_router(
     config_str: &str,
     data_dir: &std::path::Path,
     timeout_secs: u64,
+    session_id: u64,
 ) -> StartOutcome {
     let mut cmd = match app.shell().sidecar("sing-box") {
         Ok(c) => c.args(["run", "-c", config_str]),
@@ -953,8 +1056,12 @@ async fn attempt_start_singbox_router(
                     if let Some(st) = app_clone.try_state::<VpnState>() {
                         let current_pid = *st.pid_helper.lock().unwrap_or_else(|e| e.into_inner());
                         if current_pid == Some(expected_pid) {
-                            should_emit_terminated =
-                                st.pid.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+                            should_emit_terminated = st
+                                .ready_session
+                                .compare_exchange(session_id, 0, Ordering::SeqCst, Ordering::SeqCst)
+                                .is_ok()
+                                && st.session_generation.load(Ordering::SeqCst) == session_id
+                                && st.pid.lock().unwrap_or_else(|e| e.into_inner()).is_some();
                             let _ = st
                                 .process_helper
                                 .lock()
@@ -970,8 +1077,8 @@ async fn attempt_start_singbox_router(
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner())
                                 .take();
-                            if let Some(ip) = bypass_ip {
-                                remove_server_bypass_route(ip);
+                            if let Some(route) = bypass_ip {
+                                let _ = remove_server_bypass_route(route);
                             }
                         }
                     }
@@ -1137,13 +1244,7 @@ async fn attempt_start_tun2socks(
     }
 }
 
-/// Копирует wintun.dll в:
-///   1. exe_dir (рядом с sidecar-ом tun2socks.exe) — ОБЯЗАТЕЛЬНО для tun2socks,
-///      потому что wireguard-go wintun-loader вызывает LoadLibraryEx с флагом
-///      LOAD_LIBRARY_SEARCH_APPLICATION_DIR — ищет DLL строго в директории .exe,
-///      cwd игнорируется. Без этого tun2socks падает с
-///      "Error loading wintun.dll DLL: Unable to load library".
-///   2. data_dir (cwd процесса) — исторический путь для sing-box.
+/// Refreshes the WinTUN runtime copy from the bundled, pinned DLL.
 fn ensure_wintun_dll(app: &AppHandle, data_dir: &std::path::Path) -> Result<(), String> {
     let candidates = {
         let mut c = Vec::new();
@@ -1164,32 +1265,8 @@ fn ensure_wintun_dll(app: &AppHandle, data_dir: &std::path::Path) -> Result<(), 
         .find(|p| p.exists())
         .ok_or_else(|| "wintun.dll not found".to_string())?
         .clone();
-
-    // Копия в exe_dir: tun2socks (wireguard-go) ищет wintun.dll только здесь.
-    // Best-effort — в prod Program Files без админа может быть read-only; если
-    // wintun.dll уже рядом с exe (через installer), просто пропускаем.
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
-            let wintun_exe = exe_dir.join("wintun.dll");
-            if !wintun_exe.exists() && src != wintun_exe {
-                if let Err(e) = std::fs::copy(&src, &wintun_exe) {
-                    let _ = app.emit(
-                        "singbox-log",
-                        format!(
-                            "[warn] copy wintun.dll to exe_dir failed: {e} (tun2socks may fail)"
-                        ),
-                    );
-                }
-            }
-        }
-    }
-
-    // Копия в data_dir: исторический путь для sing-box (cwd→wintun.dll).
     let wintun_data = data_dir.join("wintun.dll");
-    if !wintun_data.exists() && src != wintun_data {
-        std::fs::copy(&src, &wintun_data).map_err(|e| format!("copy wintun.dll: {e}"))?;
-    }
-    Ok(())
+    refresh_verified_runtime_file(&src, &wintun_data, EXPECTED_WINTUN_SHA256, "wintun.dll")
 }
 
 fn ensure_libcronet_dll(app: &AppHandle, data_dir: &std::path::Path) -> Result<(), String> {
@@ -1212,30 +1289,8 @@ fn ensure_libcronet_dll(app: &AppHandle, data_dir: &std::path::Path) -> Result<(
         .find(|p| p.exists())
         .ok_or_else(|| "libcronet.dll not found; NaiveProxy requires it".to_string())?
         .clone();
-    verify_libcronet_binary(&src)?;
-
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
-            let dll_exe = exe_dir.join(LIBCRONET_BINARY_NAME);
-            if !dll_exe.exists() && src != dll_exe {
-                if let Err(e) = std::fs::copy(&src, &dll_exe) {
-                    let _ = app.emit(
-                        "singbox-log",
-                        format!(
-                            "[warn] copy libcronet.dll to exe_dir failed: {e} (NaiveProxy may fail)"
-                        ),
-                    );
-                }
-            }
-        }
-    }
-
     let dll_data = data_dir.join(LIBCRONET_BINARY_NAME);
-    if !dll_data.exists() && src != dll_data {
-        std::fs::copy(&src, &dll_data).map_err(|e| format!("copy libcronet.dll: {e}"))?;
-    }
-
-    Ok(())
+    refresh_verified_runtime_file(&src, &dll_data, EXPECTED_LIBCRONET_SHA256, "libcronet.dll")
 }
 
 /// Находит путь к бандленному бинарнику по полному имени (с triple-суффиксом).
@@ -1283,7 +1338,10 @@ async fn start_vpn(
     fixed_proxy_port: Option<u16>,
     route_policy: Option<String>,
 ) -> Result<(), String> {
-    check_rate_limit(&state)?;
+    let session_id = state.session_generation.fetch_add(1, Ordering::SeqCst) + 1;
+    state.ready_session.store(0, Ordering::SeqCst);
+    let _operation_guard = state.operation_lock.lock().await;
+    ensure_current_session(state.inner(), session_id)?;
 
     let vpn_mode = vpn::VpnMode::from_str(&mode);
     let route_policy = vpn::RoutePolicy::from_str(route_policy.as_deref().unwrap_or("bypass"));
@@ -1302,6 +1360,7 @@ async fn start_vpn(
                 tokio::time::sleep(Duration::from_secs(2) - elapsed).await;
             }
         }
+        ensure_current_session(state.inner(), session_id)?;
     }
 
     if vpn_mode == vpn::VpnMode::Tun && !is_elevated() {
@@ -1402,6 +1461,7 @@ async fn start_vpn(
 
     let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
+    cleanup_runtime_config_files(&data_dir);
     if params.requires_libcronet() {
         ensure_libcronet_dll(&app, &data_dir)?;
     }
@@ -1449,6 +1509,9 @@ async fn start_vpn(
 
     // Kill orphan процессы всех ядер (сессия могла остаться после краша).
     let _ = tauri::async_runtime::spawn_blocking(kill_orphan_all).await;
+    ensure_current_session(state.inner(), session_id).inspect_err(|_| {
+        remove_loaded_runtime_config(&app, &config_path);
+    })?;
 
     if !use_random_proxy_port {
         ensure_fixed_proxy_ports_available(&engine, &vpn_mode, proxy_port)?;
@@ -1533,7 +1596,11 @@ async fn start_vpn(
                 ),
             );
         }
-        match attempt_start_engine(&app, &state, &ctx).await {
+        let outcome = attempt_start_engine(&app, &state, &ctx, session_id).await;
+        ensure_current_session(state.inner(), session_id).inspect_err(|_| {
+            remove_loaded_runtime_config(&app, &config_path);
+        })?;
+        match outcome {
             StartOutcome::Ready => {
                 primary_ready = true;
                 break;
@@ -1569,14 +1636,17 @@ async fn start_vpn(
         }
     }
     if !primary_ready {
+        remove_loaded_runtime_config(&app, &config_path);
         return Err(last_err);
     }
     if engine == vpn::VpnEngine::Xray
         && !wait_for_xray_loopback(proxy_port, Duration::from_secs(2)).await
     {
         cleanup_vpn(&state);
+        remove_loaded_runtime_config(&app, &config_path);
         return Err("xray started but HTTP/SOCKS loopback inbounds are not reachable".into());
     }
+    remove_loaded_runtime_config(&app, &config_path);
 
     // Для Xray+TUN дополнительно поднимаем tun2socks поверх SOCKS-инбаунда.
     if engine == vpn::VpnEngine::Xray && vpn_mode == vpn::VpnMode::Tun {
@@ -1590,15 +1660,24 @@ async fn start_vpn(
         #[cfg(windows)]
         {
             if let Ok(gw) = detect_default_gateway() {
-                add_server_bypass_route(server_ip, gw);
-                *state
-                    .bypass_route_ip
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = Some(server_ip);
-                let _ = app.emit(
-                    "singbox-log",
-                    format!("[xray] server bypass route added: {server_ip} via {gw}"),
-                );
+                match add_server_bypass_route(server_ip, gw) {
+                    Ok(route) => {
+                        *state
+                            .bypass_route_ip
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()) = Some(route);
+                        let _ = app.emit(
+                            "singbox-log",
+                            format!("[xray] server bypass route added: {server_ip} via {gw}"),
+                        );
+                    }
+                    Err(error) => {
+                        let _ = app.emit(
+                            "singbox-log",
+                            format!("[xray] server bypass route was not added: {error}"),
+                        );
+                    }
+                }
             } else {
                 let _ = app.emit("singbox-log",
                     "[xray] default gateway not detected — bypass route skipped (risk of routing loop)");
@@ -1642,6 +1721,7 @@ async fn start_vpn(
                 &router_config_str,
                 &data_dir,
                 router_timeout_secs,
+                session_id,
             )
             .await
             {
@@ -1667,7 +1747,11 @@ async fn start_vpn(
                     }
                 }
             }
+            ensure_current_session(state.inner(), session_id).inspect_err(|_| {
+                remove_loaded_runtime_config(&app, &router_config_path);
+            })?;
         }
+        remove_loaded_runtime_config(&app, &router_config_path);
 
         if !router_ready {
             // tun2socks не смог подняться — откатываем всё (xray, bypass route).
@@ -1691,6 +1775,25 @@ async fn start_vpn(
             );
         }
     }
+
+    ensure_current_session(state.inner(), session_id)?;
+    let primary_alive = state
+        .pid
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some();
+    let helper_required = engine == vpn::VpnEngine::Xray && vpn_mode == vpn::VpnMode::Tun;
+    let helper_alive = !helper_required
+        || state
+            .pid_helper
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some();
+    if !primary_alive || !helper_alive {
+        cleanup_vpn(&state);
+        return Err("VPN engine terminated before the session became ready".into());
+    }
+    state.ready_session.store(session_id, Ordering::SeqCst);
 
     Ok(())
 }
@@ -1716,7 +1819,9 @@ async fn update_tray_icon(app: AppHandle, connected: bool) -> Result<(), String>
 
 #[tauri::command]
 async fn stop_vpn(state: State<'_, VpnState>) -> Result<(), String> {
-    check_rate_limit(&state)?;
+    state.session_generation.fetch_add(1, Ordering::SeqCst);
+    state.ready_session.store(0, Ordering::SeqCst);
+    let _operation_guard = state.operation_lock.lock().await;
 
     // Helper (tun2socks) первым — снимает TUN до того как primary умрёт.
     let helper_pid = {
@@ -1763,8 +1868,9 @@ async fn stop_vpn(state: State<'_, VpnState>) -> Result<(), String> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .take();
-    if let Some(ip) = bypass_ip {
-        let _ = tauri::async_runtime::spawn_blocking(move || remove_server_bypass_route(ip)).await;
+    if let Some(route) = bypass_ip {
+        let _ =
+            tauri::async_runtime::spawn_blocking(move || remove_server_bypass_route(route)).await;
     }
 
     Ok(())
@@ -1926,7 +2032,7 @@ async fn import_subscription_url(url: String) -> Result<subscription::Subscripti
         .build()
         .map_err(|e| format!("failed to create subscription client: {e}"))?;
 
-    let response = client.get(parsed.url).send().await.map_err(|e| {
+    let mut response = client.get(parsed.url).send().await.map_err(|e| {
         format!(
             "failed to download subscription from {}: {e}",
             parsed.safe_host
@@ -1949,17 +2055,26 @@ async fn import_subscription_url(url: String) -> Result<subscription::Subscripti
         ));
     }
 
-    let bytes = response
-        .bytes()
+    let mut bytes = Vec::with_capacity(
+        response
+            .content_length()
+            .unwrap_or(0)
+            .min(subscription::MAX_SUBSCRIPTION_BODY_BYTES as u64) as usize,
+    );
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|e| format!("failed to read subscription from {}: {e}", parsed.safe_host))?;
-    if bytes.len() > subscription::MAX_SUBSCRIPTION_BODY_BYTES {
-        return Err(format!(
-            "subscription response from {} is too large",
-            parsed.safe_host
-        ));
+        .map_err(|e| format!("failed to read subscription from {}: {e}", parsed.safe_host))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > subscription::MAX_SUBSCRIPTION_BODY_BYTES {
+            return Err(format!(
+                "subscription response from {} is too large",
+                parsed.safe_host
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
     }
-    let body = String::from_utf8(bytes.to_vec()).map_err(|_| {
+    let body = String::from_utf8(bytes).map_err(|_| {
         format!(
             "subscription response from {} is not UTF-8",
             parsed.safe_host
@@ -1971,22 +2086,9 @@ async fn import_subscription_url(url: String) -> Result<subscription::Subscripti
 
 #[cfg(windows)]
 fn cleanup_stale_proxy() {
-    use winreg::enums::*;
-    use winreg::RegKey;
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let path = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
-    if let Ok(settings) = hkcu.open_subkey_with_flags(path, KEY_READ) {
-        let enabled: u32 = settings.get_value("ProxyEnable").unwrap_or(0);
-        let server: String = settings.get_value("ProxyServer").unwrap_or_default();
-        if enabled == 1 && server.starts_with("127.0.0.1:") {
-            // Parse port from stale proxy to pass to cleanup
-            let port = server
-                .strip_prefix("127.0.0.1:")
-                .and_then(|p| p.parse::<u16>().ok())
-                .unwrap_or(2080);
-            let _ = vpn::set_system_proxy(false, port);
-        }
-    }
+    // Restore only a proxy endpoint marked as owned by a previous E13VPN+ session.
+    // A localhost proxy configured by another application must remain untouched.
+    let _ = vpn::release_system_proxy();
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -2013,8 +2115,10 @@ pub fn run() {
             mode: Mutex::new(vpn::VpnMode::Proxy),
             proxy_port: Mutex::new(0),
             clash_secret: Mutex::new(String::new()),
-            last_command: Mutex::new(Instant::now() - Duration::from_secs(1)),
             last_tun_stop: Mutex::new(None),
+            operation_lock: tokio::sync::Mutex::new(()),
+            session_generation: AtomicU64::new(0),
+            ready_session: AtomicU64::new(0),
             bypass_route_ip: Mutex::new(None),
         })
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -2027,12 +2131,14 @@ pub fn run() {
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_clipboard_manager::init())
-        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec!["--e13-autostart"]),
         ))
         .setup(|app| {
+            if let Ok(data_dir) = app.path().app_data_dir() {
+                cleanup_runtime_config_files(&data_dir);
+            }
             #[cfg(windows)]
             {
                 if let Some(win) = app.get_webview_window("main") {
@@ -2212,5 +2318,31 @@ Network Destination        Netmask          Gateway       Interface  Metric
         let err = validate_subscription_url("file:///C:/secret.txt").expect_err("reject file URL");
 
         assert!(err.contains("http"));
+    }
+
+    #[test]
+    fn refresh_verified_runtime_file_replaces_tampered_destination() {
+        use sha2::{Digest, Sha256};
+
+        let test_dir = std::env::temp_dir().join(format!(
+            "e13vpn-runtime-refresh-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&test_dir).expect("create runtime test directory");
+        let source = test_dir.join("source.dll");
+        let destination = test_dir.join("runtime.dll");
+        let trusted = b"trusted runtime bytes";
+        std::fs::write(&source, trusted).expect("write trusted source");
+        std::fs::write(&destination, b"tampered").expect("write tampered destination");
+        let expected = format!("{:x}", Sha256::digest(trusted));
+
+        refresh_verified_runtime_file(&source, &destination, &expected, "test runtime")
+            .expect("refresh runtime file");
+
+        assert_eq!(
+            std::fs::read(&destination).expect("read destination"),
+            trusted
+        );
+        let _ = std::fs::remove_dir_all(&test_dir);
     }
 }

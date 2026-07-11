@@ -761,7 +761,7 @@ fn build_dns(
 }
 
 fn build_tun_route_exclude_address(server_host: &str) -> Vec<String> {
-    let mut exclude = vec!["1.1.1.1/32".to_string(), "2000::/3".to_string()];
+    let mut exclude = vec!["1.1.1.1/32".to_string()];
     if let Ok(ip) = server_host.parse::<IpAddr>() {
         match ip {
             IpAddr::V4(_) => exclude.insert(0, format!("{server_host}/32")),
@@ -957,7 +957,7 @@ pub fn generate_singbox_config(
         }]),
         VpnMode::Tun => {
             // IPv4 → /32, IPv6 → /128, домен → пропускаем
-            let mut exclude = vec!["1.1.1.1/32".to_string(), "2000::/3".to_string()];
+            let mut exclude = vec!["1.1.1.1/32".to_string()];
             if let Ok(ip) = host.parse::<IpAddr>() {
                 match ip {
                     IpAddr::V4(_) => exclude.insert(0, format!("{host}/32")),
@@ -1042,50 +1042,189 @@ pub fn validate_route_entry(raw: &str) -> (String, bool) {
     (norm, valid)
 }
 
-/// HTTP-прокси на 127.0.0.1:{port}
-pub fn set_system_proxy(enable: bool, port: u16) -> Result<(), String> {
+#[cfg(windows)]
+const INTERNET_SETTINGS_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+#[cfg(windows)]
+const PROXY_OWNERSHIP_KEY: &str = r"Software\E13VPNPlus\ProxyOwnership";
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct SystemProxySnapshot {
+    enabled: u32,
+    server: Option<String>,
+}
+
+#[cfg(windows)]
+fn system_proxy_matches_owner(snapshot: &SystemProxySnapshot, owned_server: &str) -> bool {
+    snapshot.enabled == 1 && snapshot.server.as_deref() == Some(owned_server)
+}
+
+#[cfg(windows)]
+fn notify_system_proxy_changed() {
+    unsafe {
+        use windows_sys::Win32::Networking::WinInet::{
+            InternetSetOptionA, INTERNET_OPTION_REFRESH, INTERNET_OPTION_SETTINGS_CHANGED,
+        };
+        InternetSetOptionA(
+            std::ptr::null(),
+            INTERNET_OPTION_SETTINGS_CHANGED,
+            std::ptr::null(),
+            0,
+        );
+        InternetSetOptionA(
+            std::ptr::null(),
+            INTERNET_OPTION_REFRESH,
+            std::ptr::null(),
+            0,
+        );
+    }
+}
+
+#[cfg(windows)]
+fn read_system_proxy() -> Result<SystemProxySnapshot, String> {
+    use winreg::enums::*;
+    use winreg::RegKey;
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let settings = hkcu
+        .open_subkey_with_flags(INTERNET_SETTINGS_KEY, KEY_READ)
+        .map_err(|e| format!("open system proxy settings: {e}"))?;
+    Ok(SystemProxySnapshot {
+        enabled: settings.get_value("ProxyEnable").unwrap_or(0),
+        server: settings.get_value("ProxyServer").ok(),
+    })
+}
+
+#[cfg(windows)]
+fn write_system_proxy(snapshot: &SystemProxySnapshot) -> Result<(), String> {
+    use winreg::enums::*;
+    use winreg::RegKey;
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let settings = hkcu
+        .open_subkey_with_flags(INTERNET_SETTINGS_KEY, KEY_WRITE)
+        .map_err(|e| format!("open system proxy settings for write: {e}"))?;
+    match &snapshot.server {
+        Some(server) => settings
+            .set_value("ProxyServer", server)
+            .map_err(|e| format!("restore ProxyServer: {e}"))?,
+        None => {
+            let _ = settings.delete_value("ProxyServer");
+        }
+    }
+    settings
+        .set_value("ProxyEnable", &snapshot.enabled)
+        .map_err(|e| format!("restore ProxyEnable: {e}"))?;
+    notify_system_proxy_changed();
+    Ok(())
+}
+
+/// Claims the Windows system proxy for this E13VPN+ session.
+/// The previous values are persisted so crash recovery can restore them later.
+pub fn acquire_system_proxy(port: u16) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use winreg::enums::*;
+        use winreg::RegKey;
+
+        // Recover only a proxy that a previous E13VPN+ session still owns.
+        release_system_proxy()?;
+
+        let previous = read_system_proxy()?;
+        let owned_server = format!("127.0.0.1:{port}");
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let (ownership, _) = hkcu
+            .create_subkey(PROXY_OWNERSHIP_KEY)
+            .map_err(|e| format!("create proxy ownership marker: {e}"))?;
+        ownership
+            .set_value("OwnedProxyServer", &owned_server)
+            .map_err(|e| format!("write proxy ownership marker: {e}"))?;
+        ownership
+            .set_value("PreviousProxyEnable", &previous.enabled)
+            .map_err(|e| format!("write previous ProxyEnable: {e}"))?;
+        ownership
+            .set_value(
+                "PreviousProxyServerPresent",
+                &u32::from(previous.server.is_some()),
+            )
+            .map_err(|e| format!("write previous ProxyServer marker: {e}"))?;
+        if let Some(server) = &previous.server {
+            ownership
+                .set_value("PreviousProxyServer", server)
+                .map_err(|e| format!("write previous ProxyServer: {e}"))?;
+        }
+
+        let apply_result = (|| -> Result<(), String> {
+            let settings = hkcu
+                .open_subkey_with_flags(INTERNET_SETTINGS_KEY, KEY_WRITE)
+                .map_err(|e| format!("open system proxy settings for write: {e}"))?;
+            // Write the endpoint first so ProxyEnable never points at a stale server.
+            settings
+                .set_value("ProxyServer", &owned_server)
+                .map_err(|e| format!("set ProxyServer: {e}"))?;
+            settings
+                .set_value("ProxyEnable", &1u32)
+                .map_err(|e| format!("set ProxyEnable: {e}"))?;
+            notify_system_proxy_changed();
+            Ok(())
+        })();
+
+        if let Err(error) = apply_result {
+            let _ = write_system_proxy(&previous);
+            let _ = hkcu.delete_subkey_all(PROXY_OWNERSHIP_KEY);
+            return Err(error);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = port;
+    }
+    Ok(())
+}
+
+/// Restores the proxy snapshot only while the current proxy still matches the
+/// endpoint claimed by E13VPN+. Changes made by another application are kept.
+pub fn release_system_proxy() -> Result<(), String> {
     #[cfg(windows)]
     {
         use winreg::enums::*;
         use winreg::RegKey;
 
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-        let path = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
-        let settings = hkcu
-            .open_subkey_with_flags(path, KEY_WRITE)
-            .map_err(|e| e.to_string())?;
-
-        if enable {
-            settings
-                .set_value("ProxyEnable", &1u32)
-                .map_err(|e| e.to_string())?;
-            settings
-                .set_value("ProxyServer", &format!("127.0.0.1:{}", port))
-                .map_err(|e| e.to_string())?;
+        let ownership = match hkcu.open_subkey_with_flags(PROXY_OWNERSHIP_KEY, KEY_READ) {
+            Ok(key) => key,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(format!("open proxy ownership marker: {error}")),
+        };
+        let owned_server: String = ownership
+            .get_value("OwnedProxyServer")
+            .map_err(|e| format!("read proxy ownership marker: {e}"))?;
+        let previous_enabled: u32 = ownership
+            .get_value("PreviousProxyEnable")
+            .map_err(|e| format!("read previous ProxyEnable: {e}"))?;
+        let previous_server_present: u32 = ownership
+            .get_value("PreviousProxyServerPresent")
+            .unwrap_or(0);
+        let previous_server = if previous_server_present == 1 {
+            Some(
+                ownership
+                    .get_value("PreviousProxyServer")
+                    .map_err(|e| format!("read previous ProxyServer: {e}"))?,
+            )
         } else {
-            settings
-                .set_value("ProxyEnable", &0u32)
-                .map_err(|e| e.to_string())?;
-        }
+            None
+        };
+        drop(ownership);
 
-        // Уведомляем WinINet — без этого Chrome/Edge не подхватывают смену прокси
-        unsafe {
-            use windows_sys::Win32::Networking::WinInet::{
-                InternetSetOptionA, INTERNET_OPTION_REFRESH, INTERNET_OPTION_SETTINGS_CHANGED,
-            };
-            InternetSetOptionA(
-                std::ptr::null(),
-                INTERNET_OPTION_SETTINGS_CHANGED,
-                std::ptr::null(),
-                0,
-            );
-            InternetSetOptionA(
-                std::ptr::null(),
-                INTERNET_OPTION_REFRESH,
-                std::ptr::null(),
-                0,
-            );
+        let current = read_system_proxy()?;
+        if system_proxy_matches_owner(&current, &owned_server) {
+            write_system_proxy(&SystemProxySnapshot {
+                enabled: previous_enabled,
+                server: previous_server,
+            })?;
         }
+        hkcu.delete_subkey_all(PROXY_OWNERSHIP_KEY)
+            .map_err(|e| format!("remove proxy ownership marker: {e}"))?;
     }
     Ok(())
 }
@@ -1159,6 +1298,7 @@ mod tests {
             .expect("route excludes");
         assert!(excludes.iter().any(|entry| entry == "194.62.248.33/32"));
         assert!(excludes.iter().any(|entry| entry == "1.1.1.1/32"));
+        assert!(!excludes.iter().any(|entry| entry == "2000::/3"));
     }
 
     #[test]
@@ -1326,6 +1466,10 @@ mod tests {
             .expect("outbounds")
             .iter()
             .any(|outbound| outbound["tag"] == "block" && outbound["type"] == "block"));
+        let excludes = cfg["inbounds"][0]["route_exclude_address"]
+            .as_array()
+            .expect("route excludes");
+        assert!(!excludes.iter().any(|entry| entry == "2000::/3"));
     }
 
     #[test]
@@ -1355,5 +1499,74 @@ mod tests {
             .expect("outbounds")
             .iter()
             .any(|outbound| outbound["tag"] == "block"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn generated_naive_tun_config_is_accepted_by_bundled_singbox() {
+        let params =
+            parse_proxy_uri("naive+https://user:pass@example.com#naive").expect("parse naive URI");
+        let cfg = generate_singbox_config(
+            &params,
+            &[],
+            &[],
+            &VpnMode::Tun,
+            &RoutePolicy::Bypass,
+            2080,
+            "test-secret",
+        );
+        let binary = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("binaries")
+            .join("sing-box-x86_64-pc-windows-msvc.exe");
+        assert!(binary.exists(), "bundled sing-box binary is missing");
+
+        let config_path = std::env::temp_dir().join(format!(
+            "e13vpn-singbox-config-check-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &config_path,
+            serde_json::to_vec_pretty(&cfg).expect("serialize sing-box config"),
+        )
+        .expect("write sing-box config");
+        let output = std::process::Command::new(binary)
+            .args(["check", "-c"])
+            .arg(&config_path)
+            .output()
+            .expect("run sing-box config check");
+        let _ = std::fs::remove_file(&config_path);
+
+        assert!(
+            output.status.success(),
+            "sing-box rejected generated config: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn system_proxy_ownership_requires_exact_enabled_endpoint() {
+        let owned = "127.0.0.1:2080";
+        assert!(system_proxy_matches_owner(
+            &SystemProxySnapshot {
+                enabled: 1,
+                server: Some(owned.to_string()),
+            },
+            owned,
+        ));
+        assert!(!system_proxy_matches_owner(
+            &SystemProxySnapshot {
+                enabled: 1,
+                server: Some("127.0.0.1:7890".to_string()),
+            },
+            owned,
+        ));
+        assert!(!system_proxy_matches_owner(
+            &SystemProxySnapshot {
+                enabled: 0,
+                server: Some(owned.to_string()),
+            },
+            owned,
+        ));
     }
 }

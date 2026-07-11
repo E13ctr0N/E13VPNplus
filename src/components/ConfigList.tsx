@@ -32,9 +32,20 @@ interface ConfigListProps {
   onSelect: (id: string) => void;
   onRemove: (id: string) => void;
   onPaste: () => void;
+  pasteDisabled?: boolean;
+  status?: string;
 }
 
-export function ConfigList({ configs, activeId, connected, onSelect, onRemove, onPaste }: ConfigListProps) {
+export function ConfigList({
+  configs,
+  activeId,
+  connected,
+  onSelect,
+  onRemove,
+  onPaste,
+  pasteDisabled = false,
+  status = "",
+}: ConfigListProps) {
   const t = useT();
   const [confirmId, setConfirmId] = useState<string | null>(null);
   return (
@@ -43,22 +54,47 @@ export function ConfigList({ configs, activeId, connected, onSelect, onRemove, o
         <span style={{ fontSize: "9px", textTransform: "uppercase", letterSpacing: "1.5px", color: "var(--color-text-muted)", fontWeight: 600 }}>
           {t("vpn.servers")}
         </span>
-        <span
+        <button
+          type="button"
+          disabled={pasteDisabled}
           onClick={onPaste}
           style={{
             fontSize: "9px",
             color: configs.length === 0 ? "var(--color-success-text)" : "var(--color-text-muted)",
-            cursor: "pointer",
+            cursor: pasteDisabled ? "wait" : "pointer",
             padding: "2px 8px",
             borderRadius: "3px",
+            border: "none",
+            background: "transparent",
+            fontFamily: "var(--font-system)",
+            opacity: pasteDisabled ? 0.45 : 1,
             transition: "color 0.3s, opacity 0.15s",
           }}
-          onMouseEnter={(e) => { e.currentTarget.style.background = "var(--color-surface-hover)"; }}
+          onMouseEnter={(e) => {
+            if (!pasteDisabled) e.currentTarget.style.background = "var(--color-surface-hover)";
+          }}
           onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}
         >
           {t("vpn.paste")}
-        </span>
+        </button>
       </div>
+
+      {status && (
+        <div
+          title={status}
+          style={{
+            minHeight: "14px",
+            fontSize: "9px",
+            lineHeight: "14px",
+            color: "var(--color-text-muted)",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+          }}
+        >
+          {status}
+        </div>
+      )}
 
       <div style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: "2px" }}>
         {configs.length === 0 ? (

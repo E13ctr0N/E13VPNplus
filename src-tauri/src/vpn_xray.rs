@@ -313,4 +313,46 @@ mod tests {
             .iter()
             .any(|rule| { rule["network"] == "tcp,udp" && rule["outboundTag"] == "direct" }));
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn generated_xhttp_config_is_accepted_by_bundled_xray() {
+        let uri = "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=xhttp&security=reality&pbk=AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE&sid=abcd&sni=example.com#xhttp";
+        let params = parse_vless_uri(uri).expect("parse xhttp URI");
+        let cfg = generate_xray_config(
+            &params,
+            &[],
+            &[],
+            &VpnMode::Proxy,
+            &RoutePolicy::Bypass,
+            2080,
+        );
+        let binary = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("binaries")
+            .join("xray-x86_64-pc-windows-msvc.exe");
+        assert!(binary.exists(), "bundled Xray binary is missing");
+
+        let config_path = std::env::temp_dir().join(format!(
+            "e13vpn-xray-config-check-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &config_path,
+            serde_json::to_vec_pretty(&cfg).expect("serialize Xray config"),
+        )
+        .expect("write Xray config");
+        let output = std::process::Command::new(binary)
+            .args(["run", "-test", "-c"])
+            .arg(&config_path)
+            .output()
+            .expect("run Xray config check");
+        let _ = std::fs::remove_file(&config_path);
+
+        assert!(
+            output.status.success(),
+            "Xray rejected generated config. stdout: {} stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
 }

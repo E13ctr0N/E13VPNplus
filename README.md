@@ -79,7 +79,7 @@ After replacing binaries, update the matching SHA constants in `src-tauri/src/li
 | --- | --- |
 | Tauri | 2.11 |
 | React | 19.2.5 |
-| Vite | 8.0.10 |
+| Vite | 8.1.4 |
 | TypeScript | 6.0.3 |
 | Tailwind CSS | 4.2.4 |
 | sing-box | 1.13.x |

@@ -1,7 +1,6 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect } from "react";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
-import { load as loadStore, Store } from "@tauri-apps/plugin-store";
 import { Titlebar } from "./components/Titlebar";
 import { VpnScreen } from "./components/VpnScreen";
 import { RoutesScreen } from "./components/RoutesScreen";
@@ -9,8 +8,8 @@ import { LogsScreen } from "./components/LogsScreen";
 import { SettingsScreen } from "./components/SettingsScreen";
 import { BottomNav, Tab } from "./components/BottomNav";
 import { I18nProvider, Lang } from "./i18n";
+import { getVpnStore, queueVpnStoreSave } from "./store";
 
-const STORE_FILE = "vpn.json";
 const BASE_W = 480;
 const BASE_H = 300;
 
@@ -30,12 +29,10 @@ function App() {
   const [uiScale, setUiScale] = useState<100 | 125 | 150>(100);
   const [theme, setTheme] = useState<"dark" | "light">("dark");
   const [ready, setReady] = useState(false);
-  const storeRef = useRef<Store | null>(null);
 
   // Load settings
   useEffect(() => {
-    loadStore(STORE_FILE, { autoSave: false, defaults: {} }).then(async (store) => {
-      storeRef.current = store;
+    getVpnStore().then(async (store) => {
       setLang((await store.get<Lang>("language")) ?? "ru");
       setAutostart((await store.get<boolean>("autostart")) ?? false);
       setAutoReconnect((await store.get<boolean>("auto_reconnect")) ?? false);
@@ -60,9 +57,8 @@ function App() {
 
   // Save settings on change
   useEffect(() => {
-    if (!ready || !storeRef.current) return;
-    const store = storeRef.current;
-    (async () => {
+    if (!ready) return;
+    void queueVpnStoreSave(async (store) => {
       await store.set("language", lang);
       await store.set("autostart", autostart);
       await store.set("auto_reconnect", autoReconnect);
@@ -72,8 +68,7 @@ function App() {
       await store.set("proxy_fixed_port", proxyFixedPort);
       await store.set("ui_scale", uiScale);
       await store.set("theme", theme);
-      await store.save();
-    })();
+    }).catch((error) => console.error("Failed to save settings:", error));
   }, [
     lang,
     autostart,

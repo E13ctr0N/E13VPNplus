@@ -1,9 +1,8 @@
 import { useState, useEffect, useRef } from "react";
-import { load as loadStore, Store } from "@tauri-apps/plugin-store";
 import { invoke } from "@tauri-apps/api/core";
 import { useT } from "../i18n";
+import { getVpnStore, queueVpnStoreSave } from "../store";
 
-const STORE_FILE = "vpn.json";
 type RoutePolicy = "bypass" | "only_vpn";
 
 export function RoutesScreen() {
@@ -17,11 +16,9 @@ export function RoutesScreen() {
   const [storeReady, setStoreReady] = useState(false);
   const sitesRef = useRef<HTMLInputElement>(null);
   const appsRef = useRef<HTMLInputElement>(null);
-  const storeRef = useRef<Store | null>(null);
 
   useEffect(() => {
-    loadStore(STORE_FILE, { autoSave: false, defaults: {} }).then(async (store) => {
-      storeRef.current = store;
+    getVpnStore().then(async (store) => {
       const rawBypass = (await store.get<string[]>("routes_bypass")) ?? [];
       const rawApps = (await store.get<string[]>("routes_bypass_apps")) ?? [];
       const savedPolicy = (await store.get<RoutePolicy>("routes_policy")) ?? "bypass";
@@ -41,14 +38,12 @@ export function RoutesScreen() {
   }, []);
 
   useEffect(() => {
-    if (!storeReady || !storeRef.current) return;
-    const store = storeRef.current;
-    (async () => {
+    if (!storeReady) return;
+    void queueVpnStoreSave(async (store) => {
       await store.set("routes_bypass", bypass);
       await store.set("routes_bypass_apps", bypassApps);
       await store.set("routes_policy", routePolicy);
-      await store.save();
-    })();
+    }).catch((error) => console.error("Failed to save routes:", error));
   }, [bypass, bypassApps, routePolicy, storeReady]);
 
   async function addSite() {
