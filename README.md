@@ -1,81 +1,83 @@
 # E13VPN+
 
-Windows VPN client for VLESS + Reality and NaiveProxy, including `xhttp` / `splithttp` support through Xray-core.
+VPN-клиент для Windows с поддержкой VLESS + Reality и NaiveProxy, включая транспорты `xhttp` / `splithttp` через Xray-core.
 
-Built with Tauri v2, React, sing-box and Xray-core.
+Построен на Tauri v2, React, sing-box и Xray-core.
 
 <p align="center">
-  <img src="screenshots/vpn-connected.png" width="420" alt="VPN connected">
-  <img src="screenshots/settings.png" width="420" alt="Settings">
+  <img src="screenshots/vpn-connected.png" width="420" alt="E13VPN+ — подключение установлено">
+  <img src="screenshots/settings.png" width="420" alt="E13VPN+ — настройки">
 </p>
 
-## Difference From E13VPN
+## Отличия от E13VPN
 
-E13VPN+ is the extended version of the base [E13VPN](https://github.com/E13ctr0N/E13VPN) client.
-It keeps the sing-box path for regular transports and NaiveProxy, and adds Xray-core for `xhttp` / `splithttp`.
+E13VPN+ — расширенная версия базового клиента [E13VPN](https://github.com/E13ctr0N/E13VPN).
+Обычные транспорты и NaiveProxy работают через sing-box, а для `xhttp` / `splithttp` используется Xray-core.
 
-Engine selection is automatic:
+Движок выбирается автоматически:
 
-- `xhttp` / `splithttp` -> Xray-core.
-- `tcp`, `ws`, `http`, `grpc`, `quic`, `httpupgrade` -> sing-box.
-- `naive+https` / `naive+quic` -> sing-box NaiveProxy outbound.
+- `xhttp` / `splithttp` → Xray-core;
+- `tcp`, `ws`, `http`, `grpc`, `quic`, `httpupgrade` → sing-box;
+- `naive+https` / `naive+quic` → NaiveProxy outbound в sing-box.
 
-Use E13VPN+ when the server uses `xhttp` / `splithttp`. Use the base E13VPN when those transports are not needed and a smaller package is preferable.
+E13VPN+ стоит выбирать, если сервер использует `xhttp` / `splithttp` или NaiveProxy. Базовый E13VPN подойдёт, когда эти протоколы не нужны и важен меньший размер установщика.
 
-## Features
+## Возможности
 
-- Proxy mode: system HTTP proxy on a random local port.
-- TUN mode: system traffic through a virtual WinTUN adapter.
-- VLESS and NaiveProxy config storage with Windows DPAPI encryption.
-- 3x-ui compatible subscription import for plain/Base64 URI lists.
-- Domain/IP route bypass.
-- Per-application bypass for sing-box transports and for Xray in TUN mode through the local sing-box router.
-- Real-time speed indicator through sing-box Clash API.
-- Auto-reconnect with backoff.
-- Windows autostart.
-- Tray icon status.
-- Dark/light theme.
-- Russian/English UI.
-- Single-instance guard.
+- Proxy-режим: системный HTTP-прокси на случайном локальном порту.
+- TUN-режим: системный трафик через виртуальный адаптер WinTUN.
+- Поддержка VLESS + Reality и NaiveProxy (`naive+https`, `naive+quic`).
+- Шифрование сохранённых конфигураций через Windows DPAPI.
+- Импорт совместимых с 3x-ui подписок: обычные и Base64-списки URI.
+- Обход VPN по доменам и IP-адресам.
+- Обход VPN для отдельных приложений в sing-box и в Xray TUN через локальный sing-box router.
+- Индикатор скорости в реальном времени через sing-box Clash API.
+- Автоматическое переподключение с увеличивающейся задержкой.
+- Автозапуск вместе с Windows.
+- Иконка в трее с отображением статуса.
+- Тёмная и светлая темы.
+- Русский и английский интерфейс.
+- Защита от запуска второго экземпляра.
 
-## Known Limits
+## Известные ограничения
 
-- `bypass_apps` is not supported in Xray Proxy mode. Xray TUN mode uses a local sing-box router, so per-process bypass can work there.
-- The speed indicator uses sing-box Clash API and is disabled for Xray connections.
-- `Xray + TUN` uses Xray for `xhttp` / `splithttp` and a local sing-box TUN router for routes and DNS. The server bypass route currently requires an IPv4 server address.
-- Subscription import stores the imported server links. The subscription URL itself is not stored or auto-refreshed yet; unsupported protocols such as `vmess`, `trojan`, `ss`, and `hysteria` are skipped.
-- `wintun.dll` is required for TUN mode but is ignored by git. Download it with `scripts/get-wintun.ps1` before building from a clean clone.
-- `libcronet.dll` is required for NaiveProxy outbound and is bundled from the official sing-box Windows archive.
+- `bypass_apps` не поддерживается в Xray Proxy. В Xray TUN обход по приложениям работает через локальный sing-box router.
+- Индикатор скорости использует sing-box Clash API и отключён при прямом подключении через Xray.
+- В режиме `Xray + TUN` транспорт `xhttp` / `splithttp` обслуживает Xray, а маршруты и DNS — локальный sing-box TUN router. Для маршрута обхода сервера сейчас требуется его IPv4-адрес.
+- При импорте подписки сохраняются ссылки на серверы. URL самой подписки пока не сохраняется и автоматически не обновляется. Неподдерживаемые протоколы (`vmess`, `trojan`, `ss`, `hysteria`) пропускаются.
+- Для TUN необходим `wintun.dll`, который не хранится в Git. Перед сборкой из чистого клона загрузите его через `scripts/get-wintun.ps1`.
+- Для NaiveProxy необходим `libcronet.dll`; скрипт сборки загружает его из официального Windows-архива sing-box.
+- UDP через NaiveProxy в TUN по умолчанию блокируется. Для серверов с поддержкой UDP over TCP его можно явно включить параметром `uot=1` в URI.
 
-## Build From Source
+## Сборка из исходников
 
-Requirements:
+Требования:
 
-- Windows 10+.
-- Node.js compatible with Vite 8 (`^20.19.0 || >=22.12.0`).
-- Rust stable.
-- Administrator rights for TUN mode runtime testing.
+- Windows 10 или новее;
+- Node.js, совместимый с Vite 8 (`^20.19.0 || >=22.12.0`);
+- стабильная версия Rust;
+- права администратора для запуска и проверки TUN-режима.
 
-Install dependencies and build:
+Установите зависимости и соберите приложение:
 
 ```bash
 npm install
 npm run tauri build
 ```
 
-Download VPN engine binaries when preparing a clean checkout:
+Для сборки из чистого клона загрузите VPN-движки и WinTUN:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\get-engines.ps1
 powershell -ExecutionPolicy Bypass -File scripts\get-wintun.ps1
 ```
 
-`get-engines.ps1` downloads sing-box, `libcronet.dll`, and Xray-core into `src-tauri/binaries/` and prints SHA256 values.
-After replacing binaries, update the matching SHA constants in `src-tauri/src/lib.rs`.
+`get-engines.ps1` загружает sing-box, `libcronet.dll` и Xray-core в `src-tauri/binaries/`, а затем выводит их SHA256.
+После замены бинарных файлов обновите соответствующие SHA-константы в `src-tauri/src/lib.rs`.
 
-## Stack
+## Технологии
 
-| Component | Version |
+| Компонент | Версия |
 | --- | --- |
 | Tauri | 2.11 |
 | React | 19.2.5 |
@@ -85,9 +87,9 @@ After replacing binaries, update the matching SHA constants in `src-tauri/src/li
 | sing-box | 1.13.x |
 | Xray-core | v26.3.27 |
 
-## Verification
+## Проверка
 
-Useful local checks:
+Основные локальные проверки:
 
 ```bash
 npm run build
@@ -98,6 +100,6 @@ cargo test --manifest-path src-tauri/Cargo.toml
 npm run tauri build
 ```
 
-## License
+## Лицензия
 
 MIT
