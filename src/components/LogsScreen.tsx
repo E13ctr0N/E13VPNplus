@@ -1,11 +1,17 @@
 import { useLayoutEffect, useRef, useState } from "react";
 import { useT } from "../i18n";
 
-interface LogsScreenProps {
-  logLines: string[];
+export interface LogLine {
+  id: number;
+  text: string;
 }
 
-export function LogsScreen({ logLines }: LogsScreenProps) {
+interface LogsScreenProps {
+  logLines: LogLine[];
+  active: boolean;
+}
+
+export function LogsScreen({ logLines, active }: LogsScreenProps) {
   const t = useT();
   const logRef = useRef<HTMLDivElement>(null);
   const followingBottom = useRef(true);
@@ -13,10 +19,10 @@ export function LogsScreen({ logLines }: LogsScreenProps) {
 
   useLayoutEffect(() => {
     const el = logRef.current;
-    if (el && autoScroll && followingBottom.current) {
+    if (el && active && autoScroll && followingBottom.current) {
       el.scrollTop = el.scrollHeight;
     }
-  }, [logLines, autoScroll]);
+  }, [logLines, active, autoScroll]);
 
   return (
     <div
@@ -67,9 +73,9 @@ export function LogsScreen({ logLines }: LogsScreenProps) {
           </span>
         </div>
       ) : (
-        logLines.map((line, i) => (
+        logLines.map(({ id, text: line }) => (
           <div
-            key={i}
+            key={id}
             style={{
               fontSize: "9px",
               lineHeight: "1.5",

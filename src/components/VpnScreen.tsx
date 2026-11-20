@@ -67,7 +67,8 @@ function isSubscriptionUrl(text: string): boolean {
 interface VpnScreenProps {
   connected: boolean;
   setConnected: (v: boolean) => void;
-  setLogLines: React.Dispatch<React.SetStateAction<string[]>>;
+  appendLog: (text: string) => void;
+  clearLogs: () => void;
   autoReconnect?: boolean;
   autoConnectOnAutostart?: boolean;
   proxyUseSystemProxy: boolean;
@@ -97,7 +98,8 @@ type SubscriptionImportResult = {
 export function VpnScreen({
   connected,
   setConnected,
-  setLogLines,
+  appendLog,
+  clearLogs,
   autoReconnect,
   autoConnectOnAutostart,
   proxyUseSystemProxy,
@@ -141,7 +143,7 @@ export function VpnScreen({
     const bypassApps = (await store.get<string[]>("routes_bypass_apps")) ?? [];
     const routePolicy = (await store.get<RoutePolicy>("routes_policy")) ?? "bypass";
     if (source !== "manual") {
-      setLogLines((prev) => [...prev, `[${source}] connecting...`]);
+      appendLog(`[${source}] connecting...`);
     }
     await invoke("start_vpn", {
       uri: cfg.uri,
@@ -266,10 +268,7 @@ export function VpnScreen({
       if (!autoReconnect || manualDisconnect.current) return;
       const attempt = reconnectAttempt.current;
       if (attempt >= MAX_RECONNECT_ATTEMPTS) {
-        setLogLines((prev) => [
-          ...prev,
-          `[auto-reconnect] gave up after ${MAX_RECONNECT_ATTEMPTS} attempts`,
-        ]);
+        appendLog(`[auto-reconnect] gave up after ${MAX_RECONNECT_ATTEMPTS} attempts`);
         reconnectAttempt.current = 0;
         setReconnecting(false);
         return;
@@ -278,10 +277,7 @@ export function VpnScreen({
       const delay = Math.min(3000 * Math.pow(2, attempt), 60000);
       reconnectAttempt.current = attempt + 1;
       setReconnecting(true);
-      setLogLines((prev) => [
-        ...prev,
-        `[auto-reconnect] attempt ${attempt + 1}/${MAX_RECONNECT_ATTEMPTS} in ${Math.round(delay / 1000)}s...`,
-      ]);
+      appendLog(`[auto-reconnect] attempt ${attempt + 1}/${MAX_RECONNECT_ATTEMPTS} in ${Math.round(delay / 1000)}s...`);
       reconnectTimer.current = setTimeout(async () => {
         setReconnecting(false);
         if (manualDisconnect.current) return;
@@ -290,23 +286,18 @@ export function VpnScreen({
         try {
           await startConfig(cfg, "auto-reconnect");
         } catch (err) {
-          setLogLines((prev) => [...prev, `[auto-reconnect] failed: ${String(err)}`]);
+          appendLog(`[auto-reconnect] failed: ${String(err)}`);
           scheduleReconnect();
         }
       }, delay);
     }
 
-    const unlistenLog = listen<string>("singbox-log", (e) => {
-      setLogLines((prev) => {
-        const next = [...prev, e.payload];
-        return next.length > 200 ? next.slice(-200) : next;
-      });
-    });
+    const unlistenLog = listen<string>("singbox-log", (e) => appendLog(e.payload));
     const unlistenTerm = listen<string>("singbox-terminated", (e) => {
       // Capture uptime before clearing connectTime
       const uptime = connectTimeRef.current ? Date.now() - connectTimeRef.current : 0;
       markDisconnected();
-      setLogLines((prev) => [...prev, `[terminated] ${e.payload}`]);
+      appendLog(`[terminated] ${e.payload}`);
 
       // Auto-reconnect with exponential backoff (3s, 6s, 12s... max 10 attempts)
       if (autoReconnect && !manualDisconnect.current) {
@@ -325,7 +316,7 @@ export function VpnScreen({
       unlistenTerm.then((f) => f());
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
     };
-  }, [setConnected, setLogLines, autoReconnect]);
+  }, [setConnected, appendLog, autoReconnect]);
 
   // Save on change
   useEffect(() => {
@@ -335,9 +326,9 @@ export function VpnScreen({
       await store.set("activeId", activeId);
       await store.set("vpn_mode", vpnMode);
     }).catch((error) => {
-      setLogLines((prev) => [...prev, `[store] save failed: ${String(error)}`]);
+      appendLog(`[store] save failed: ${String(error)}`);
     });
-  }, [configs, activeId, vpnMode, storeReady]);
+  }, [configs, activeId, vpnMode, storeReady, appendLog]);
 
   // Auto-connect only when the app was launched by the Windows autostart entry.
   useEffect(() => {
@@ -351,16 +342,16 @@ export function VpnScreen({
       const launchedFromAutostart = await invoke<boolean>("is_autostart_launch").catch(() => false);
       if (!launchedFromAutostart) return;
       setBusy("connecting");
-      setLogLines([]);
+      clearLogs();
       try {
         await startConfig(cfg, "auto-start");
       } catch (err) {
-        setLogLines((prev) => [...prev, `[auto-start] failed: ${String(err)}`]);
+        appendLog(`[auto-start] failed: ${String(err)}`);
       } finally {
         setBusy(false);
       }
     })();
-  }, [storeReady, autoConnectOnAutostart, connected, busy, configs, activeId]);
+  }, [storeReady, autoConnectOnAutostart, connected, busy, configs, activeId, appendLog, clearLogs]);
 
   // Timer
   useEffect(() => {
@@ -409,16 +400,13 @@ export function VpnScreen({
       if (isSupportedConfigUri(text)) {
         const added = appendConfigUris([text]);
         setImportStatus(added > 0 ? t("vpn.server_added") : t("vpn.server_exists"));
-        setLogLines((prev) => [
-          ...prev,
-          added > 0 ? "[import] added 1 server" : "[import] server already exists",
-        ]);
+        appendLog(added > 0 ? "[import] added 1 server" : "[import] server already exists");
         return;
       }
 
       if (isSubscriptionUrl(text)) {
         setImportStatus(t("vpn.subscription_loading"));
-        setLogLines((prev) => [...prev, "[subscription] downloading..."]);
+        appendLog("[subscription] downloading...");
         const result = await invoke<SubscriptionImportResult>("import_subscription_url", { url: text });
         const added = appendConfigUris(result.configs);
         const skipped = result.skipped > 0 ? `, skipped ${result.skipped}` : "";
@@ -430,15 +418,15 @@ export function VpnScreen({
             ? `${t("vpn.subscription_imported")}: ${added}/${result.configs.length}`
             : t("vpn.subscription_empty")
         );
-        setLogLines((prev) => [...prev, message]);
+        appendLog(message);
         return;
       }
 
       setImportStatus(t("vpn.clipboard_unsupported"));
-      setLogLines((prev) => [...prev, "[import] unsupported clipboard format"]);
+      appendLog("[import] unsupported clipboard format");
     } catch (err) {
       setImportStatus(`${t("vpn.import_failed")}: ${String(err)}`);
-      setLogLines((prev) => [...prev, `[subscription] failed: ${String(err)}`]);
+      appendLog(`[subscription] failed: ${String(err)}`);
     }
   }
 
@@ -459,7 +447,7 @@ export function VpnScreen({
         await invoke("stop_vpn");
         markDisconnected();
       } catch (e) {
-        setLogLines((prev) => [...prev, `[error] stop_vpn failed: ${String(e)}`]);
+        appendLog(`[error] stop_vpn failed: ${String(e)}`);
       } finally {
         setBusy(false);
       }
@@ -473,7 +461,7 @@ export function VpnScreen({
       if (!connected) {
         manualDisconnect.current = false;
         setBusy("connecting");
-        setLogLines([]);
+        clearLogs();
         await startConfig(cfg, "manual");
       } else {
         setBusy("disconnecting");
@@ -485,7 +473,7 @@ export function VpnScreen({
       }
     } catch (e) {
       if (!String(e).includes("connection cancelled")) {
-        setLogLines((prev) => [...prev, `[error] ${String(e)}`]);
+        appendLog(`[error] ${String(e)}`);
       }
     } finally {
       setBusy(false);
