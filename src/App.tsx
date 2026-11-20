@@ -1,10 +1,10 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
 import { Titlebar } from "./components/Titlebar";
 import { VpnScreen } from "./components/VpnScreen";
 import { RoutesScreen } from "./components/RoutesScreen";
-import { LogsScreen } from "./components/LogsScreen";
+import { LogsScreen, type LogLine } from "./components/LogsScreen";
 import { SettingsScreen } from "./components/SettingsScreen";
 import { BottomNav, Tab } from "./components/BottomNav";
 import { I18nProvider, Lang } from "./i18n";
@@ -16,7 +16,13 @@ const BASE_H = 300;
 function App() {
   const [tab, setTab] = useState<Tab>("vpn");
   const [connected, setConnected] = useState(false);
-  const [logLines, setLogLines] = useState<string[]>([]);
+  const [logLines, setLogLines] = useState<LogLine[]>([]);
+  const nextLogId = useRef(0);
+  const appendLog = useCallback((text: string) => {
+    const entry = { id: nextLogId.current++, text };
+    setLogLines((prev) => [...prev.slice(-199), entry]);
+  }, []);
+  const clearLogs = useCallback(() => setLogLines([]), []);
 
   // Settings state
   const [lang, setLang] = useState<Lang>("ru");
@@ -124,7 +130,8 @@ function App() {
             <VpnScreen
               connected={connected}
               setConnected={setConnected}
-              setLogLines={setLogLines}
+              appendLog={appendLog}
+              clearLogs={clearLogs}
               autoReconnect={autoReconnect}
               autoConnectOnAutostart={autoConnectOnAutostart}
               proxyUseSystemProxy={proxyUseSystemProxy}
@@ -136,7 +143,7 @@ function App() {
             <RoutesScreen />
           </div>
           <div style={{ flex: 1, display: tab === "logs" ? "flex" : "none", flexDirection: "column", overflow: "hidden" }}>
-            <LogsScreen logLines={logLines} />
+            <LogsScreen logLines={logLines} active={tab === "logs"} />
           </div>
           <div style={{ flex: 1, display: tab === "settings" ? "flex" : "none", flexDirection: "column", overflow: "hidden" }}>
             <SettingsScreen

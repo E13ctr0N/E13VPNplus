@@ -45,6 +45,7 @@ const translations = {
 
   // LogsScreen
   "logs.empty": { ru: "логов пока нет", en: "no logs yet" },
+  "logs.auto_scroll": { ru: "Автопрокрутка", en: "Auto-scroll" },
 
   // SettingsScreen
   "settings.general": { ru: "Основные", en: "General" },
