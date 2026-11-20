@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import { useT } from "../i18n";
 
 interface LogsScreenProps {
@@ -8,14 +8,15 @@ interface LogsScreenProps {
 export function LogsScreen({ logLines }: LogsScreenProps) {
   const t = useT();
   const logRef = useRef<HTMLDivElement>(null);
+  const followingBottom = useRef(true);
+  const [autoScroll, setAutoScroll] = useState(true);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const el = logRef.current;
-    if (el) {
-      const isAtBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 30;
-      if (isAtBottom) el.scrollTop = el.scrollHeight;
+    if (el && autoScroll && followingBottom.current) {
+      el.scrollTop = el.scrollHeight;
     }
-  }, [logLines]);
+  }, [logLines, autoScroll]);
 
   return (
     <div
@@ -27,8 +28,24 @@ export function LogsScreen({ logLines }: LogsScreenProps) {
         background: "var(--color-titlebar)",
       }}
     >
+      <label style={{ padding: "8px 12px", color: "var(--color-text-muted)", fontSize: "10px" }}>
+        <input
+          type="checkbox"
+          checked={autoScroll}
+          onChange={(event) => {
+            const enabled = event.currentTarget.checked;
+            if (enabled) followingBottom.current = true;
+            setAutoScroll(enabled);
+          }}
+        />{" "}
+        {t("logs.auto_scroll")}
+      </label>
       <div
         ref={logRef}
+        onScroll={(event) => {
+          const el = event.currentTarget;
+          followingBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 30;
+        }}
         style={{
           flex: 1,
           overflowY: "auto",
